@@ -1,0 +1,30 @@
+# Host-side dependencies for the dataset_generation pipeline (Python 3.10).
+#
+#   conda activate tib_data
+#   pip install -r requirements.txt
+#
+# Scripts launched via `blenderproc run` (generation/, rendering/,
+# pipelines/convert_glb_to_blend.py) execute inside BlenderProc's bundled
+# Blender Python, not this env. bpy and mathutils come from Blender itself.
+# BlenderProc ships numpy, opencv, imageio and PyYAML there; tqdm must be added:
+#
+#   blenderproc pip install tqdm
+
+# Rendering / scene generation (provides `blenderproc run` + bundled Blender)
+blenderproc==2.7.0
+
+# Core numerics and image I/O
+numpy<2
+opencv-python
+imageio
+tqdm
+
+# Config parsing (optional: config/yaml_lite.py falls back to a built-in parser)
+PyYAML
+
+# Objaverse model download (preparation/download_objaverse.py) and
+# object-name lookup for the test split (generation/naming.py)
+objaverse
+pandas
+huggingface_hub
+fsspec

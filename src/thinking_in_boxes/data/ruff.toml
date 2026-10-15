@@ -1,0 +1,30 @@
+line-length = 88
+target-version = "py38"
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E741",  # ambiguous variable names kept from the original code
+    "UP015",  # explicit "r" mode is not used here
+]
+
+[lint.per-file-ignores]
+# BlenderProc requires `import blenderproc` to be the first import of the
+# script it runs, which conflicts with import sorting and module-level
+# import placement.
+"generation/generate_scenes.py" = ["E402", "I001"]
+"rendering/render_scenes.py" = ["E402", "I001"]
+"pipelines/convert_glb_to_blend.py" = ["E402", "I001"]
+"launching/launch.py" = ["E402"]
+"pipelines/distribute_generate.py" = ["E402"]
+"pipelines/run_ablations.py" = ["E402"]
+
+[lint.isort]
+known-first-party = [
+    "blender",
+    "config",
+    "generation",
+    "launching",
+    "pipelines",
+    "rendering",
+]

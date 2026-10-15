@@ -1,0 +1,51 @@
+[project]
+name = "Thinking-In-Boxes"
+version = "0.1.0"
+description = "Official codebase for [NeurIPS'26] Thinking in Boxes: 3D Editing in Real Images Made Easy"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.15.0",
+    "datasets>=5.1.0",
+    "diffusers>=0.41.0",
+    "einops>=0.8.2",
+    "ftfy>=6.3.1",
+    "gradio>=6.30.0",
+    "iopath>=0.1.10",
+    "kernels>=0.17.2",
+    "peft>=0.21.2",
+    "prodigyopt>=1.1.2",
+    "setuptools<80",
+    "torch==2.14.1",
+    "torchvision>=0.29.1",
+    "transformers>=5.19.0",
+    "utils3d",
+    "vis4d==1.0.0",
+    "vis4d-cuda-ops",
+    "wandb>=0.30.0",
+]
+
+[project.scripts]
+thinking-in-boxes = "thinking_in_boxes:main"
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+no-build-isolation-package = ["vis4d-cuda-ops"]
+override-dependencies = ["pydantic>=2.0"]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+vis4d-cuda-ops = { git = "https://github.com/SysCV/vis4d_cuda_ops.git" }
+utils3d = { git = "https://github.com/EasternJournalist/utils3d.git" }
+
+[tool.uv.extra-build-dependencies]
+vis4d-cuda-ops = ["torch"]

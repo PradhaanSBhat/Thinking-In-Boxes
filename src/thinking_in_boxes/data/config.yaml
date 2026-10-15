@@ -1,0 +1,130 @@
+# =============================================================================
+# Dataset generation — configuration
+# =============================================================================
+# This is the only file you need to edit. Every script reads it.
+#
+#   1. Set `data_root` below to point at your assets.
+#   2. Run:  ./scripts/generate_train.sh  &&  ./scripts/render_train.sh
+#
+# Anything here can still be overridden per-run on the command line, e.g.
+#   python3 launch.py render --data-root /somewhere/else ...
+# and with a different config file entirely:
+#   python3 launch.py --config my_config.yaml render ...
+# =============================================================================
+
+
+# --- Paths -------------------------------------------------------------------
+paths:
+  # REQUIRED. Root of the asset datasets (models, HDRIs, materials).
+  # Supports ~ and relative paths.
+  data_root: /path/to/datasets
+
+  # Where generated scenes and logs are written.
+  output_root: ./output
+
+  # Scene directories. Leave as-is to place them under output_root;
+  # set absolute paths to scatter them across filesystems.
+  train_scenes:       ${output_root}/scenes_train
+  test_scenes_camera: ${output_root}/scenes_test_camera
+  test_scenes_object: ${output_root}/scenes_test_object
+  ablation_root:      ${output_root}/ablations
+  log_root:           ${output_root}/logs
+
+
+# --- How much to generate ----------------------------------------------------
+scale:
+  # Train scene indices are GLOBAL. To shard across machines, give each one a
+  # disjoint start/count (machine A: 0 + 20000, machine B: 20000 + 20000, ...).
+  train_start: 0
+  train_scenes: 20000
+
+  # Test scenes generated per mode (camera_movement, object_movement).
+  test_scenes: 500
+
+  # Phase-1 (CPU, no GPU) parallel workers.
+  num_workers: 40
+
+
+# --- Objects per scene -------------------------------------------------------
+# Each scene gets a random number of objects in [min, max] (inclusive).
+# Leave a value empty/null to use the split's built-in default
+# (config/profiles.py: train 4..4, test 1..1). Override per run with
+# --min-obj / --max-obj.
+objects:
+  train_min: 2
+  train_max: 2
+  test_min: 1
+  test_max: 1
+
+
+# --- Rendering ---------------------------------------------------------------
+render:
+  # Which GPUs to use, e.g. [0, 1, 2]. Leave empty/null to auto-detect all.
+  gpu_ids: []
+
+  # Concurrent render processes per GPU.
+  procs_per_gpu: 5
+
+  # Scenes handed to each BlenderProc launch.
+  batch_size: 50
+
+  # Draft quality: 256px @ 16spp instead of 512px @ 32spp. Useful for smoke tests.
+  fast: false
+
+  # Mask outputs: depth_*.png, mask_*.png, obj_mask_*.png, bbox_coords_*.json.
+  #   false / null — off. A render produces rgb_*.png, bbox_*.png and
+  #                  view_*.json only. This is the default.
+  #   true         — add every mask output to the render.
+  # Masks can also be generated afterwards, for scenes that already have
+  # their RGB and bbox renders:  ./scripts/render_masks_only.sh
+  masks: false
+
+
+# --- Asset preprocessing (phase 0, run once) ---------------------------------
+# Downloads all write under data_root:
+#   ./scripts/download_objaverse.sh   -> <data_root>/<dataset>/raw/...
+#   ./scripts/download_arsg_assets.sh -> <data_root>/ARSG-110K/...
+# Which HDRI / material directories are indexed is the list at the top of
+# generation/assets.py.
+assets:
+  dataset: ObjaverseXL_sketchfab
+
+  # Source .glb files and the .blend output directory. The scene generator
+  # only indexes .blend files under a `converted/` directory, so blend_output
+  # should end in `converted`.
+  glb_input:    ${data_root}/${dataset}/raw/hf-objaverse-v1/glbs
+  blend_output: ${data_root}/${dataset}/converted
+
+  # Glob used to discover inputs, relative to glb_input.
+  # Objaverse nests as <hash-prefix>/<uid>.glb; use "*.glb" for a flat folder.
+  pattern: "*/*.glb"
+
+
+# --- Ablations ---------------------------------------------------------------
+# Single-factor test sets, each isolating one kind of object variation so a
+# model's sensitivity to it can be measured independently. All use the test
+# split in object_movement mode.
+ablations:
+  translate_rotate_scale:
+    scenes: 500
+    translation: true
+    scaling: true
+    rotation: true
+
+  only_translate:
+    scenes: 100
+    translation: true
+    scaling: false
+    rotation: false
+
+  only_scale:
+    scenes: 100
+    translation: false
+    scaling: true
+    rotation: false
+
+  only_rotate:
+    scenes: 100
+    translation: false
+    scaling: false
+    rotation: true

@@ -1,0 +1,1727 @@
+<!DOCTYPE html>
+<!--
+  ═══════════════════════════════════════════════════════════════════════════
+  Thinking in Boxes — 3D Box Editor
+  ═══════════════════════════════════════════════════════════════════════════
+
+  A single-file, dependency-free web tool for placing and editing 3D
+  bounding boxes over a background image. The exported scene JSON is the
+  conditioning signal for the Thinking-in-Boxes generative pipeline.
+
+  ─── How to use ──────────────────────────────────────────────────────────
+    1. Drag-and-drop or upload an image (left rail · ↑ button).
+    2. Press + (top-right) and click+drag a 2-D rectangle around an object
+       to place a box; the editor extrudes it into 3-D at a sensible depth.
+    3. Drag faces / edges / corners directly on the canvas to translate,
+       rotate, resize, or scale.  Hold Alt or use middle-mouse to orbit.
+    4. Use the Floor bar (bottom-right) to tweak the ground plane, or press
+       Shift+F for keyboard-driven floor edits.
+    5. Export the scene JSON via the { } row in the export popup
+       (Shift+O is the shortcut).  Import via the { } row in the left rail
+       (Shift+I).
+
+  ─── Exports ─────────────────────────────────────────────────────────────
+    📦 Boxes        — opaque colour-coded box image (model conditioning)
+    🖼 Overlay      — image + translucent boxes
+    ◼ This Box      — single primitive for pipeline component-figures
+    { } Scene JSON  — full v2 scene state (boxes, floor, camera, depth order)
+
+  ─── Scene JSON (v2) — outline ───────────────────────────────────────────
+    {
+      "version": 2,
+      "imgName": "owl_cup",
+      "fov":     900,
+      "camDist": 900,
+      "floor":   { show, infinite, x, y, z, w, d, step, yaw, pitch, roll },
+      "boxes":   [ { id, cx, cy, cz, w, h, d, yaw, pitch, roll, label }, … ],
+      "depthOrder":  [front, …, back],          // optional, by box index
+      "imgOrigSize": [origW, origH]             // optional, used for renderer fov scaling
+    }
+
+  ─── Code layout ─────────────────────────────────────────────────────────
+    <style>     UI panels, popups, hints, drop-zone, mode hint-bar
+    <body>      canvas, left rail, top-right add/delete/detect, floor bar,
+                shortcuts popup, welcome overlay
+    <script>
+      CONSTANTS — face colours, fill alphas, edge layout, kbd steps
+      MATH      — rotMat / decomposeRot / mul3 / rotAxis / rotateScene
+      GEOMETRY  — boxVerts / proj / floor auto-fit / scene centroid
+      RENDERING — drawFloor / drawBox / renderBoxesOpaque + Translucent
+      INTERACTION HELPERS — nearestVert / nearestEdge / drawEdgeHandles
+      STATE     — boxes[], floor, camera, viewR, activeMode, etc.
+      INPUT     — pointer / keyboard / wheel / drop handlers
+      EXPORTS   — boxes / overlay / primitive / JSON
+      IMPORTS   — image + scene JSON
+      MAIN LOOP — render() + requestAnimationFrame
+  ═══════════════════════════════════════════════════════════════════════════
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Box Editor</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&family=Cormorant+Garamond:ital,wght@0,600;1,600&family=JetBrains+Mono:wght@400;500&display=swap');
+:root{
+  --bg:#f6f3ee;--outer:#e0ddd6;--panel:rgba(255,255,255,0.97);--panel2:rgba(252,250,247,0.98);
+  --border:#d8d4cb;--border2:#c8c4bb;
+  --text:#1a1714;--text2:#7a746c;--text3:#aba49c;
+  --acc:#c0604a;--acc2:#8c4434;--acc-light:rgba(192,96,74,.10);--acc-glow:rgba(192,96,74,.18);
+  --green:#3da05a;--blue:#4470c8;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:100%;overflow:hidden;background:var(--outer);font-family:Outfit,sans-serif;color:var(--text)}
+#c{display:block;position:fixed;inset:0}
+/* editor heading + project-page-style floating boxes */
+#tibEdTitle{position:fixed;left:16px;top:13px;z-index:22;display:flex;align-items:center;gap:9px;pointer-events:none;font-family:'Cormorant Garamond',Georgia,serif}
+#tibEdTitle .g{width:26px;height:26px;flex:none}
+#tibEdTitle .tt{font-weight:600;font-size:1.5rem;line-height:1;color:var(--text);letter-spacing:-.01em}
+#tibEdTitle .tt em{font-style:italic;color:var(--acc)}
+.ed-cube{position:fixed;z-index:1;pointer-events:none;opacity:.15;animation:edfloat 10s ease-in-out infinite}
+.ed-cube.ec1{left:2.5%;bottom:11%;width:72px}
+.ed-cube.ec2{left:11%;bottom:27%;width:46px;opacity:.11;animation-delay:1.6s}
+@keyframes edfloat{0%,100%{transform:translateY(0) rotate(-6deg)}50%{transform:translateY(-12px) rotate(6deg)}}
+#c.grabbing{cursor:grabbing!important}
+#c.ew-r{cursor:ew-resize!important}
+#c.ns-r{cursor:ns-resize!important}
+#c.nesw-r{cursor:nesw-resize!important}
+#c.move-c{cursor:move!important}
+#c.cross-c{cursor:crosshair!important}
+#c.grab-c{cursor:grab!important}
+#c.del-c{cursor:pointer!important}
+
+/* ── LEFT PANEL ── */
+#lp{position:fixed;left:14px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:2px;padding:5px;background:var(--panel);border:1px solid var(--border);border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.08);z-index:20;user-select:none}
+.lb{width:40px;height:40px;border-radius:8px;border:1px solid transparent;background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--text3);transition:all .15s;position:relative;font-size:.9rem}
+.lb:hover{background:var(--acc-light);color:var(--acc);border-color:rgba(192,96,74,.2)}
+.lb.on{background:var(--acc-light);color:var(--acc);border-color:rgba(192,96,74,.35)}
+.lb svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.lbtt{position:absolute;left:calc(100% + 9px);top:50%;transform:translateY(-50%);background:var(--text);color:#fff;font-size:.7rem;font-weight:500;white-space:nowrap;padding:3px 8px;border-radius:5px;pointer-events:none;opacity:0;transition:opacity .14s;z-index:50;letter-spacing:.02em}
+.lb:hover .lbtt{opacity:1}
+.lsep{height:1px;background:var(--border);margin:2px 3px}
+/* mode buttons */
+.mbtn2{width:40px;height:30px;border-radius:7px;border:1px solid transparent;background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--text3);transition:all .15s;position:relative;font-size:.72rem;font-weight:700;letter-spacing:.04em;font-family:Outfit,sans-serif}
+.mbtn2:hover{background:var(--acc-light);color:var(--acc);border-color:rgba(192,96,74,.2)}
+.mbtn2.on{background:var(--acc-light);color:var(--acc);border-color:rgba(192,96,74,.4)}
+.mbtn2 .lbtt{position:absolute;left:calc(100% + 9px);top:50%;transform:translateY(-50%);background:var(--text);color:#fff;font-size:.7rem;font-weight:500;white-space:nowrap;padding:3px 8px;border-radius:5px;pointer-events:none;opacity:0;transition:opacity .14s;z-index:50}
+.mbtn2:hover .lbtt{opacity:1}
+
+/* ── BOTTOM-RIGHT BUTTONS ── */
+.br-btn{display:flex;align-items:center;gap:7px;padding:7px 13px;background:var(--panel);border:1px solid var(--border);border-radius:99px;cursor:pointer;color:var(--text2);font-size:.76rem;font-weight:600;letter-spacing:.03em;transition:all .16s;user-select:none;box-shadow:0 2px 8px rgba(0,0,0,.07)}
+.br-btn:hover{background:var(--acc-light);border-color:rgba(192,96,74,.35);color:var(--acc);box-shadow:0 2px 12px rgba(192,96,74,.15)}
+.br-btn.on{background:var(--acc-light);border-color:rgba(192,96,74,.4);color:var(--acc)}
+.br-btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;flex-shrink:0}
+#brStack{position:fixed;right:14px;bottom:14px;z-index:20}
+
+/* ── TOP-RIGHT ── */
+#addModeBtn{position:fixed;right:14px;top:14px;z-index:20;width:38px;height:38px;border-radius:9px;border:1px solid var(--border);background:var(--panel);cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--text2);font-size:1.2rem;font-weight:400;transition:all .16s;box-shadow:0 2px 8px rgba(0,0,0,.07);user-select:none}
+#addModeBtn:hover,#delBoxBtn:hover{background:var(--acc-light);border-color:rgba(192,96,74,.4);color:var(--acc)}
+#addModeBtn.on{background:rgba(61,160,90,.08);border-color:rgba(61,160,90,.5);color:var(--green)}
+/* Delete-box button: stacked UNDER the + button */
+#delBoxBtn{position:fixed;right:14px;top:62px;z-index:20;width:38px;height:38px;border-radius:9px;border:1px solid var(--border);background:var(--panel);cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--text2);font-size:1.4rem;font-weight:400;transition:all .16s;box-shadow:0 2px 8px rgba(0,0,0,.07);user-select:none}
+#delBoxBtn.on{background:rgba(192,96,74,.10);border-color:rgba(192,96,74,.55);color:var(--acc)}
+#delBoxBtn[disabled]{opacity:.4;cursor:not-allowed}
+#delHint{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:var(--acc);color:#fff;padding:6px 16px;border-radius:8px;font-size:.78rem;font-weight:500;z-index:25;display:none;pointer-events:none;box-shadow:0 2px 10px rgba(192,96,74,.3);letter-spacing:.01em}
+#detectBtn{position:fixed;right:14px;top:110px;z-index:20;width:38px;height:62px;border-radius:9px;border:1px solid var(--border);background:var(--panel);cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;color:var(--text3);font-size:.62rem;font-weight:600;transition:all .16s;box-shadow:0 2px 8px rgba(0,0,0,.07);user-select:none}
+#detectBtn.ready{color:var(--blue);border-color:rgba(68,112,200,.3)}
+#detectBtn.busy{opacity:.55;pointer-events:none}
+#ptBar{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:40;display:none;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);border-radius:11px;padding:8px 8px 8px 14px;box-shadow:0 8px 24px rgba(0,0,0,.14);font-size:.72rem;color:var(--text3)}
+#ptBar.on{display:flex}
+#ptBar b{color:var(--text)}
+#ptBar button{font:inherit;font-weight:600;border:1px solid var(--border);border-radius:7px;padding:5px 12px;cursor:pointer;background:#fff;color:var(--text)}
+#ptBar button:hover{border-color:rgba(192,96,74,.4)}
+#ptBar #ptRun{background:var(--acc);color:#fff;border-color:var(--acc)}
+#detectBtn:hover{background:var(--acc-light);border-color:rgba(192,96,74,.35);color:var(--acc)}
+#detectBtn .di{font-size:.9rem}
+#detectBtn .dl{font-size:.55rem;letter-spacing:.02em}
+
+/* ── POPUPS ── */
+.pop{position:fixed;left:65px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;z-index:30;box-shadow:0 4px 20px rgba(0,0,0,.1);display:none;overflow:hidden;min-width:190px}
+.pop.open{display:block}
+.poph{padding:7px 12px;border-bottom:1px solid var(--border);font-size:.63rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text3)}
+.prow{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;font-size:.76rem;color:var(--text2);border-bottom:1px solid rgba(0,0,0,.04);transition:background .12s}
+.prow:last-child{border-bottom:none}
+.prow:hover{background:var(--acc-light);color:var(--acc)}
+.prow.sel{background:var(--acc-light);color:var(--acc)}
+.prow .dot{width:8px;height:8px;border-radius:2px;flex-shrink:0}
+.prow .pn{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.prow .ps{font-size:.67rem;color:var(--text3);margin-top:1px}
+.padd{width:100%;padding:8px 12px;background:transparent;border:none;border-top:1px solid var(--border);cursor:pointer;font-size:.73rem;color:var(--green);text-align:left;font-family:Outfit,sans-serif;transition:color .12s}
+.depth-btn{width:20px;height:20px;border:1px solid var(--border);border-radius:4px;background:transparent;cursor:pointer;font-size:.7rem;color:var(--text2);display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .12s;line-height:1}
+.depth-btn:hover{background:var(--acc-light);color:var(--acc);border-color:rgba(192,96,74,.3)}
+.depth-pos{font-size:.6rem;color:var(--text3);min-width:14px;text-align:center;font-family:"JetBrains Mono",monospace}
+.padd:hover{color:#2a8045}
+.scales{display:flex;gap:4px;padding:7px 12px;border-bottom:1px solid var(--border);align-items:center}
+.scales span{font-size:.65rem;color:var(--text3);margin-right:3px}
+.scbtn{padding:2px 8px;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text3);cursor:pointer;font-size:.68rem;font-family:'JetBrains Mono',monospace;transition:all .12s}
+.scbtn.on{background:var(--acc-light);border-color:rgba(192,96,74,.4);color:var(--acc)}
+
+/* ── SHORTCUTS POPUP ── */
+#spop{min-width:310px;max-height:80vh;overflow-y:auto}
+.sbody{padding:10px 14px;display:flex;flex-direction:column;gap:4px}
+.srow{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:.72rem;padding:1px 0}
+.srow .sl{color:var(--text);flex:1;min-width:0}
+.srow .sk{display:inline-flex;gap:4px;align-items:center;flex-shrink:0}
+.srow .sk kbd{font-family:'JetBrains Mono',monospace;font-size:.62rem;background:rgba(0,0,0,.05);border:1px solid var(--border2);border-radius:3px;padding:1px 5px;color:var(--text);display:inline-flex;align-items:center;line-height:1.3}
+.srow .sk .khint{font-size:.66rem;color:var(--text3);font-style:italic;margin-right:2px}
+.ssep{height:1px;background:var(--border);margin:6px 0 4px}
+.ssec{font-size:.62rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--acc);padding:3px 0 1px}
+.ssec-sub{font-weight:500;color:var(--text3);text-transform:none;letter-spacing:.02em;font-size:.65rem;margin-left:4px}
+.mico{display:inline-flex;align-items:center;gap:2px;vertical-align:middle}
+.mico svg{width:12px;height:16px;stroke:currentColor;fill:none;stroke-width:1.3;stroke-linecap:round;stroke-linejoin:round;overflow:visible}
+
+/* ── HINT ── */
+#hint{position:fixed;pointer-events:none;z-index:40;background:var(--text);color:#fff;font-size:.7rem;font-weight:500;padding:5px 10px;border-radius:6px;display:none;white-space:normal;max-width:320px;line-height:1.5;letter-spacing:.02em;box-shadow:0 2px 8px rgba(0,0,0,.18)}
+#hint svg{width:11px;height:14px;stroke:currentColor;fill:none;stroke-width:1.3;stroke-linecap:round;vertical-align:middle;margin:0 1px}
+
+/* ── ADD HINT BANNER ── */
+#addHint{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:var(--green);color:#fff;padding:6px 16px;border-radius:8px;font-size:.78rem;font-weight:500;z-index:25;display:none;pointer-events:none;box-shadow:0 2px 10px rgba(61,160,90,.3);letter-spacing:.01em}
+#addHint strong,#delHint strong,#depthHint strong{font-weight:700;letter-spacing:.04em;margin-right:2px}
+.hk{font-family:'JetBrains Mono',monospace;font-size:.65rem;background:rgba(255,255,255,.22);border:1px solid rgba(255,255,255,.35);border-radius:3px;padding:.5px 5px;color:inherit;margin:0 1px}
+/* "Drag" pictogram — mouse with a horizontal motion arrow, used inline in
+   hint banners and the floating instruction overlay.                       */
+.di-drag{display:inline-flex;align-items:center;gap:3px;vertical-align:middle;margin:0 4px 0 2px}
+.di-drag svg{width:24px;height:14px;stroke:currentColor;fill:none;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round;overflow:visible}
+
+/* ── DEPTH HINT ── */
+#depthHint{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:var(--green);color:#fff;padding:6px 16px;border-radius:8px;font-size:.78rem;font-weight:500;z-index:25;display:none;pointer-events:none;box-shadow:0 2px 10px rgba(61,160,90,.3);letter-spacing:.01em}
+
+/* ── TOAST ── */
+#tst{position:fixed;bottom:62px;left:50%;transform:translateX(-50%) translateY(5px);background:var(--text);color:#fff;border-radius:7px;padding:5px 14px;font-size:.75rem;font-weight:500;opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;z-index:60}
+#tst.on{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* ── DROP ZONE ── */
+#dz{display:none;position:fixed;inset:0;z-index:50;background:rgba(246,243,238,.9);border:2px dashed rgba(192,96,74,.5);margin:16px;border-radius:14px;align-items:center;justify-content:center;flex-direction:column;gap:8px}
+#dz.on{display:flex}
+#dz .di{font-size:2.2rem}
+#dz .dt{font-size:.95rem;font-weight:600;color:var(--text)}
+#dz .ds{font-size:.76rem;color:var(--text2)}
+
+input[type=file]{display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="tibEdTitle">
+  <svg class="g" viewBox="0 0 100 100" fill="none" stroke="#c0604a" stroke-width="6" stroke-linejoin="round">
+    <path d="M20 35 L50 20 L80 35 L50 50 Z"/><path d="M20 35 L20 70 L50 85 L50 50 Z"/><path d="M80 35 L80 70 L50 85 L50 50 Z"/></svg>
+  <span class="tt">3D Box <em>Editor</em></span>
+</div>
+<svg class="ed-cube ec1" viewBox="0 0 100 100" fill="none" stroke="#c0604a" stroke-width="4" stroke-linejoin="round">
+  <path d="M20 35 L50 20 L80 35 L50 50 Z"/><path d="M20 35 L20 70 L50 85 L50 50 Z"/><path d="M80 35 L80 70 L50 85 L50 50 Z"/></svg>
+<svg class="ed-cube ec2" viewBox="0 0 100 100" fill="none" stroke="#c0604a" stroke-width="4" stroke-linejoin="round">
+  <path d="M20 35 L50 20 L80 35 L50 50 Z"/><path d="M20 35 L20 70 L50 85 L50 50 Z"/><path d="M80 35 L80 70 L50 85 L50 50 Z"/></svg>
+
+<!-- Left panel -->
+<div id="lp">
+  <label class="lb" title="Upload Image">
+    <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+    <span class="lbtt">Upload Image</span>
+    <input type="file" id="imgFile" accept="image/*">
+  </label>
+  <label class="lb" title="Import Scene JSON" style="font-size:.72rem;font-weight:700;font-family:'JetBrains Mono',monospace">
+    <span>{ }</span>
+    <span class="lbtt">Import Scene JSON</span>
+    <input type="file" id="importJsonFile" accept=".json">
+  </label>
+  <div class="lb" id="blBtn"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="8" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/></svg><span class="lbtt">Boxes</span></div>
+  <div class="lsep"></div>
+  <div class="lb" id="srcBtn"><svg viewBox="0 0 24 24"><path d="M6 3h12a1 1 0 0 1 1 1v16l-7-4-7 4V4a1 1 0 0 1 1-1z"/></svg><span class="lbtt">Set current boxes as SOURCE</span></div>
+  <div class="lb" id="exBtn"><svg viewBox="0 0 24 24"><path d="M12 3v11M8 10l4 4 4-4"/><path d="M3 17v2a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-2"/></svg><span class="lbtt">Export</span></div>
+  <div class="lsep"></div>
+  <div class="lb" id="hlBtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a3 3 0 0 1 5 1.5c0 1.5-2 2.5-2 2.5"/><path d="M12 17.5v.5"/></svg><span class="lbtt">Shortcuts</span></div>
+  <div class="lsep"></div>
+  <div class="mbtn2" data-mode="T"><span>T</span><span class="lbtt">Toggle Translate Mode (T)</span></div>
+  <div class="mbtn2" data-mode="R"><span>R</span><span class="lbtt">Toggle Rotate Mode (R)</span></div>
+  <div class="mbtn2" data-mode="S"><span>S</span><span class="lbtt">Toggle Scale Mode (S)</span></div>
+  <div class="mbtn2" data-mode="C"><span>C</span><span class="lbtt">Toggle Camera Mode (C)</span></div>
+</div>
+<div id="addModeBtn" title="Add box">＋</div>
+<div id="delBoxBtn" title="Delete selected box (Del/Backspace)">−</div>
+<div id="detectBtn" title="Auto-detect objects (WildDet3D)"><span class="di">🔍</span><span class="dl">Detect</span></div>
+<div id="ptBar"><span class="pi">Click each object&nbsp;·&nbsp;<b>Shift-click</b> excludes&nbsp;·&nbsp;<b>Right-click</b> removes&nbsp;·&nbsp;<b id="ptCount">0</b> point(s)</span><button id="ptRun">Detect</button><button id="ptText">Type labels</button><button id="ptCfg" title="Set detector endpoint">⚙</button><button id="ptCancel">Cancel</button></div>
+<div id="depthHint"><strong>Step 2 / 2</strong> · <span class="di-drag"><svg viewBox="0 0 24 14"><rect x="1" y="2" width="6" height="10" rx="2"/><line x1="4" y1="2" x2="4" y2="6.5"/><rect x="1" y="2" width="3" height="4.5" rx="1.2" fill="currentColor" opacity=".55" stroke="none"/><line x1="10" y1="7" x2="22" y2="7"/><polyline points="12.5,4 9.5,7 12.5,10"/><polyline points="19.5,4 22.5,7 19.5,10"/></svg></span>Drag to set depth · click to confirm · <kbd class="hk">Esc</kbd> cancels</div>
+<div id="addHint"><strong>Step 1 / 2</strong> · <span class="di-drag"><svg viewBox="0 0 22 14"><rect x="2" y="1.5" width="12" height="9" rx=".5" stroke-dasharray="2.4,1.6" stroke-width="1.3"/><line x1="14" y1="10.5" x2="19.5" y2="13.5" stroke-width="1.25"/><polyline points="17.6,13.5 19.5,13.5 18.9,11.6" stroke-width="1.25"/></svg></span>Drag a rectangle around the object · <kbd class="hk">Esc</kbd> cancels</div>
+<div id="delHint">🗑 Click any box to delete it · <kbd class="hk">Esc</kbd> cancels</div>
+
+<!-- Box list popup -->
+<div class="pop" id="blPop" style="top:50%;transform:translateY(-50%)">
+  <div class="poph" style="display:flex;justify-content:space-between;align-items:center">
+    <span>Boxes <span id="bcnt" style="opacity:.5;font-weight:400"></span></span>
+    <span id="depthModeLabel" style="font-size:.6rem;cursor:pointer;color:var(--acc);letter-spacing:.06em" onclick="window.resetDepth()" title="Reset to camera-distance ordering">Auto Depth</span>
+  </div>
+  <div style="padding:4px 8px;font-size:.63rem;color:var(--text3);border-bottom:1px solid var(--border)">Front ↑ ↓ Back</div>
+  <div id="blist"></div>
+  <button class="padd" onclick="addBoxRandom()">+ Add box</button>
+</div>
+
+<!-- Export popup -->
+<div class="pop" id="exPop" style="bottom:14px">
+  <div class="poph" style="display:flex;justify-content:space-between;align-items:center"><span>Export</span><span style="font-size:.62rem;color:var(--acc);opacity:.7">P = preview</span></div>
+  <div class="scales"><span>Scale</span>
+    <button class="scbtn on" onclick="setXScale(1,this)">1×</button>
+    <button class="scbtn" onclick="setXScale(2,this)">2×</button>
+    <button class="scbtn" onclick="setXScale(4,this)">4×</button>
+  </div>
+  <div class="prow" onclick="doExportClean()"><div><div>📦 Boxes</div><div class="ps">Box conditioning (current / target)</div></div></div>
+  <div class="prow" onclick="doExportPair()"><div><div>📦📦 Source + Target boxes</div><div class="ps">Both conditioning images for inference</div></div></div>
+  <div class="prow" onclick="doExportOverlay()"><div><div>🖼 Overlay</div><div class="ps">Image + translucent boxes</div></div></div>
+  <div class="prow" onclick="doExportPrim(null)"><div><div>◼ This Box</div><div class="ps">Single primitive for pipeline</div></div></div>
+  <div class="prow" onclick="exportWithDepthReminder()"><div><div>{ } Export Scene JSON</div><div class="ps">Save scene state · Shift+O</div></div></div>
+
+</div>
+
+<!-- Shortcuts popup -->
+<div class="pop" id="spop" style="top:50%;transform:translateY(-50%)">
+  <div class="poph">Shortcuts</div>
+  <div class="sbody">
+    <!-- Mouse — direct manipulation on a box -->
+    <div class="ssec">Mouse — direct manipulation</div>
+    <div class="srow"><span class="sl">Move box</span>
+      <span class="sk"><span class="mico"><svg viewBox="0 0 11 15"><rect x=".6" y=".6" width="9.8" height="13.8" rx="2.2" stroke-width="1.1"/><line x1="5.5" y1=".6" x2="5.5" y2="6.8" stroke-width="1.1"/><rect x=".6" y=".6" width="4.9" height="6.2" rx="1.6" fill="currentColor" opacity=".55" stroke="none"/></svg></span><span class="khint">drag face</span></span></div>
+    <div class="srow"><span class="sl">Rotate box</span>
+      <span class="sk"><span class="mico"><svg viewBox="0 0 11 15"><rect x=".6" y=".6" width="9.8" height="13.8" rx="2.2" stroke-width="1.1"/><line x1="5.5" y1=".6" x2="5.5" y2="6.8" stroke-width="1.1"/><rect x="5.5" y=".6" width="4.9" height="6.2" rx="1.6" fill="currentColor" opacity=".55" stroke="none"/></svg></span><span class="khint">drag face</span></span></div>
+    <div class="srow"><span class="sl">Resize W / H / D</span>
+      <span class="sk"><span class="mico"><svg viewBox="0 0 11 15"><rect x=".6" y=".6" width="9.8" height="13.8" rx="2.2" stroke-width="1.1"/><line x1="5.5" y1=".6" x2="5.5" y2="6.8" stroke-width="1.1"/><rect x=".6" y=".6" width="4.9" height="6.2" rx="1.6" fill="currentColor" opacity=".55" stroke="none"/></svg></span><span class="khint">drag edge</span></span></div>
+    <div class="srow"><span class="sl">Scale uniformly</span>
+      <span class="sk"><span class="mico"><svg viewBox="0 0 11 15"><rect x=".6" y=".6" width="9.8" height="13.8" rx="2.2" stroke-width="1.1"/><line x1="5.5" y1=".6" x2="5.5" y2="6.8" stroke-width="1.1"/><rect x=".6" y=".6" width="4.9" height="6.2" rx="1.6" fill="currentColor" opacity=".55" stroke="none"/></svg></span><span class="khint">drag corner</span></span></div>
+    <div class="srow"><span class="sl">Scale by scroll</span>
+      <span class="sk"><span class="mico"><svg viewBox="0 0 11 18"><rect x=".6" y="3.6" width="9.8" height="13.8" rx="2.2" stroke-width="1.1"/><rect x="4.2" y="5" width="2.6" height="5" rx="1.3" fill="currentColor" opacity=".55" stroke="none"/><path d="M5.5 .5 L7.5 2 L5.5 3 L3.5 2 Z" fill="currentColor" opacity=".75" stroke="none"/><path d="M5.5 .5 L5.5 3" stroke-width=".7"/></svg></span><span class="khint">scroll over box</span></span></div>
+    <div class="srow"><span class="sl">Orbit scene</span>
+      <span class="sk"><span class="mico"><svg viewBox="0 0 11 15"><rect x=".6" y=".6" width="9.8" height="13.8" rx="2.2" stroke-width="1.1"/><rect x="4.2" y="2" width="2.6" height="5" rx="1.3" fill="currentColor" opacity=".55" stroke="none"/></svg></span><span class="khint">drag</span><span class="khint">or</span><kbd>Alt</kbd>+<span class="mico"><svg viewBox="0 0 11 15"><rect x=".6" y=".6" width="9.8" height="13.8" rx="2.2" stroke-width="1.1"/><line x1="5.5" y1=".6" x2="5.5" y2="6.8" stroke-width="1.1"/><rect x=".6" y=".6" width="4.9" height="6.2" rx="1.6" fill="currentColor" opacity=".55" stroke="none"/></svg></span><span class="khint">drag</span></span></div>
+    <div class="srow"><span class="sl">Zoom in / out</span>
+      <span class="sk"><span class="mico"><svg viewBox="0 0 11 18"><rect x=".6" y="3.6" width="9.8" height="13.8" rx="2.2" stroke-width="1.1"/><rect x="4.2" y="5" width="2.6" height="5" rx="1.3" fill="currentColor" opacity=".55" stroke="none"/><path d="M5.5 .5 L7.5 2 L5.5 3 L3.5 2 Z" fill="currentColor" opacity=".75" stroke="none"/><path d="M5.5 .5 L5.5 3" stroke-width=".7"/></svg></span><span class="khint">scroll on empty</span></span></div>
+
+    <div class="ssep"></div>
+
+    <!-- Mode toggles -->
+    <div class="ssec">Mode toggles</div>
+    <div class="srow"><span class="sl">Toggle Translate mode</span><span class="sk"><kbd>Shift</kbd>+<kbd>T</kbd></span></div>
+    <div class="srow"><span class="sl">Toggle Rotate mode</span>   <span class="sk"><kbd>Shift</kbd>+<kbd>R</kbd></span></div>
+    <div class="srow"><span class="sl">Toggle Scale mode</span>    <span class="sk"><kbd>Shift</kbd>+<kbd>S</kbd></span></div>
+    <div class="srow"><span class="sl">Toggle Camera mode</span>   <span class="sk"><kbd>Shift</kbd>+<kbd>C</kbd></span></div>
+    <div class="srow"><span class="sl">Toggle Floor mode</span>    <span class="sk"><kbd>Shift</kbd>+<kbd>F</kbd></span></div>
+    <div class="srow"><span class="sl">Exit any mode</span>        <span class="sk"><kbd>Esc</kbd></span></div>
+
+    <div class="ssep"></div>
+
+    <!-- Keyboard — selected box -->
+    <div class="ssec">Keyboard — selected box</div>
+    <div class="srow"><span class="sl">Resize W / H</span>      <span class="sk"><kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd></span></div>
+    <div class="srow"><span class="sl">Resize Depth</span>      <span class="sk"><kbd>[</kbd> <kbd>]</kbd></span></div>
+    <div class="srow"><span class="sl">Move X / Y</span>        <span class="sk"><kbd>Ctrl</kbd>+<kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd></span></div>
+    <div class="srow"><span class="sl">Rotate yaw / pitch</span><span class="sk"><kbd>Shift</kbd>+<kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd></span></div>
+    <div class="srow"><span class="sl">Roll</span>              <span class="sk"><kbd>Q</kbd> <kbd>E</kbd></span></div>
+    <div class="srow"><span class="sl">Delete box</span>        <span class="sk"><kbd>Del</kbd></span></div>
+    <div class="srow"><span class="sl">Undo / Redo</span>       <span class="sk"><kbd>Ctrl</kbd>+<kbd>Z</kbd> · <kbd>Ctrl</kbd>+<kbd>Y</kbd></span></div>
+    <div class="srow"><span class="sl">Boxes-only preview</span><span class="sk"><kbd>P</kbd></span></div>
+    <div class="srow"><span class="sl">Export scene JSON</span><span class="sk"><kbd>Shift</kbd>+<kbd>O</kbd></span></div>
+    <div class="srow"><span class="sl">Import scene JSON</span><span class="sk"><kbd>Shift</kbd>+<kbd>I</kbd></span></div>
+
+    <div class="ssep"></div>
+
+    <!-- Floor edit shortcuts -->
+    <div class="ssec">Floor mode <span class="ssec-sub">(after Shift+F)</span></div>
+    <div class="srow"><span class="sl">Move on X / Y</span>   <span class="sk"><kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd></span></div>
+    <div class="srow"><span class="sl">Depth (Z)</span>       <span class="sk"><kbd>[</kbd> <kbd>]</kbd></span></div>
+    <div class="srow"><span class="sl">Scale</span>           <span class="sk"><kbd>+</kbd> <kbd>−</kbd></span></div>
+    <div class="srow"><span class="sl">Yaw / Pitch</span>     <span class="sk"><kbd>Shift</kbd>+<kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd></span></div>
+    <div class="srow"><span class="sl">Roll</span>            <span class="sk"><kbd>Q</kbd> <kbd>E</kbd></span></div>
+  </div>
+</div>
+
+</div>
+<!-- Bottom-right stack: Camera on top, Auto+Floor below — all same width -->
+<div id="brStack" style="position:fixed;right:14px;bottom:14px;z-index:20;display:flex;flex-direction:column;gap:4px">
+  <!-- Camera group: mode toggle + re-centre -->
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:4px;display:flex;gap:3px;align-items:stretch;box-shadow:0 2px 8px rgba(0,0,0,.07)">
+    <div id="camBtn" class="br-btn" style="padding:7px 12px;box-shadow:none;flex:1;justify-content:center" title="Toggle Camera mode (C)">
+      <svg viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+      Camera
+    </div>
+    <div id="camRecenterBtn" class="br-btn" style="padding:7px 10px;box-shadow:none" title="Re-centre camera (reset pan + zoom)">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
+    </div>
+  </div>
+  <!-- Floor: compact group. Buttons sized to content, no flex-1 stretch. -->
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:4px;display:flex;gap:3px;align-items:stretch;box-shadow:0 2px 8px rgba(0,0,0,.07)">
+    <span style="font-size:.6rem;font-weight:700;letter-spacing:.06em;color:var(--text3);align-self:center;padding:0 3px 0 6px;text-transform:uppercase">Floor</span>
+    <div id="autoFloorBtn" class="br-btn" style="padding:7px 12px;font-size:.72rem;box-shadow:none" title="Auto-fit floor extent to box bounds">Auto</div>
+    <div id="infFloorBtn"  class="br-btn" style="padding:7px 12px;font-size:1rem;font-weight:700;box-shadow:none" title="Toggle infinite floor (huge bounded plane)">∞</div>
+    <div id="floorBtn"     class="br-btn" style="padding:7px 12px;box-shadow:none" title="Toggle Floor Mode (F)"><svg viewBox="0 0 24 24"><path d="M3 17l9 4 9-4"/><path d="M3 12l9 4 9-4"/><path d="M3 7l9 4 9-4"/></svg>Edit</div>
+    <div id="hideFloorBtn" class="br-btn" style="padding:7px 10px;font-size:.85rem;box-shadow:none" title="Show / hide floor">👁</div>
+  </div>
+</div>
+
+<!-- Action hint -->
+<div id="hint"></div>
+
+<!-- Mode hint bar (universal — content swapped by setMode) -->
+<style>
+  /* Mode hint bar — flex row so SVG mouse icons, kbd chips, and text labels
+     all line up on the same baseline regardless of their intrinsic heights. */
+  #modeHintBar { display:none; position:fixed; left:50%; top:60px; transform:translateX(-50%); z-index:30;
+                 background:var(--panel); border:1px solid var(--acc); color:var(--text);
+                 padding:8px 14px; border-radius:8px; box-shadow:0 4px 14px rgba(0,0,0,.12);
+                 font-size:.72rem; font-family:Outfit,sans-serif; max-width:96vw;
+                 white-space:nowrap; overflow-x:auto;
+                 align-items:center; gap:6px }
+  #modeHintBar.show { display:flex }
+  #modeHintBar .mh-title { color:var(--acc); font-weight:700; letter-spacing:.04em }
+  #modeHintBar .mh-sep   { color:var(--text3); padding:0 2px }
+  #modeHintBar .mh-dot   { color:var(--text2); padding:0 4px }
+  #modeHintBar kbd       { font-family:'JetBrains Mono',monospace; background:rgba(0,0,0,.05);
+                           border:1px solid var(--border2); border-radius:3px; padding:1px 5px;
+                           color:var(--text); display:inline-flex; align-items:center; line-height:1.3 }
+  #modeHintBar .mb       { display:inline-flex; align-items:center; gap:4px; line-height:1 }
+  #modeHintBar .mb svg   { width:12px; height:15px; stroke:currentColor; fill:none; stroke-width:1.3;
+                           stroke-linecap:round; display:block }
+  #modeHintBar .mh-item  { display:inline-flex; align-items:center; gap:4px }
+</style>
+<div id="modeHintBar"></div>
+
+<!-- Export reminder: confirm depth-order before saving -->
+<!-- Floating side panel — sits on top of the preview, doesn't cover it.
+     The Boxes panel is opened simultaneously so the user can change order. -->
+<div id="exportReminder" style="display:none;position:fixed;right:14px;top:60px;z-index:90;width:310px;background:var(--panel);border:1.5px solid var(--acc);border-radius:12px;padding:1rem 1.1rem;box-shadow:0 12px 32px rgba(0,0,0,.18);font-family:Outfit,sans-serif">
+  <div style="display:flex;align-items:flex-start;gap:.6rem;margin-bottom:.5rem">
+    <div style="font-family:'Cormorant Garamond',serif;font-size:1.15rem;font-weight:600;color:var(--text);flex:1">Check depth order</div>
+    <button onclick="_closeExportReminder()" style="width:24px;height:24px;border:1px solid var(--border);background:var(--panel);color:var(--text2);border-radius:50%;font-size:.85rem;cursor:pointer;line-height:1;padding:0">✕</button>
+  </div>
+  <p style="font-size:.74rem;color:var(--text2);line-height:1.5;margin-bottom:.55rem">
+    Painted front → back. If a closer box is clipped, use ↑ / ↓ in the
+    <strong style="color:var(--text)">Boxes</strong> panel (now open on the left) to move it forward.
+  </p>
+  <ol id="exportDepthList" style="list-style:none;padding:.45rem .6rem;margin:0 0 .65rem;background:var(--bg2,#f0ede6);border:1px solid var(--border);border-radius:8px;font-size:.74rem;color:var(--text);line-height:1.65;max-height:220px;overflow-y:auto"></ol>
+  <div style="display:flex;gap:.4rem;justify-content:flex-end">
+    <button onclick="_closeExportReminder()" style="font-family:Outfit;font-size:.72rem;font-weight:600;padding:.35rem .75rem;border-radius:99px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer">Cancel</button>
+    <button onclick="_closeExportReminder();window.doExportJson?.()" style="font-family:Outfit;font-size:.72rem;font-weight:600;padding:.35rem .85rem;border-radius:99px;border:none;background:var(--acc);color:#fff;cursor:pointer">Export JSON</button>
+  </div>
+</div>
+
+<!-- First-load welcome overlay -->
+<div id="welcomePop" style="display:none;position:fixed;inset:0;z-index:80;background:rgba(20,18,16,.72);backdrop-filter:blur(8px);align-items:center;justify-content:center;padding:2rem">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:1.75rem 2rem;max-width:520px;box-shadow:0 18px 50px rgba(0,0,0,.35);font-family:Outfit,sans-serif">
+    <div style="font-family:'Cormorant Garamond',serif;font-size:1.7rem;font-weight:600;margin-bottom:.35rem;color:var(--text)">Welcome to the 3D Box Editor</div>
+    <p style="font-size:.86rem;color:var(--text2);line-height:1.55;margin-bottom:1rem">
+      Place 3D boxes around objects in your image, then drag, rotate, scale, or rearrange them.
+      Export the scene as JSON to drive the editing model.
+    </p>
+    <ul style="list-style:none;padding:0;margin:0 0 1.1rem;display:grid;grid-template-columns:1fr 1fr;gap:.45rem .9rem;font-size:.78rem;color:var(--text2)">
+      <li><strong style="color:var(--text)">▢ Boxes</strong> drag / scale / rotate</li>
+      <li><strong style="color:var(--text)">▦ Floor</strong> use the bottom-right bar</li>
+      <li><strong style="color:var(--text)">📷 Camera</strong> orbit + pan the scene</li>
+      <li><strong style="color:var(--text)">📁 Import / Export</strong> in the left rail</li>
+    </ul>
+    <p style="font-size:.78rem;color:var(--text2);margin-bottom:1rem">
+      Tap the <strong style="color:var(--acc)">?</strong> button on the left rail any time to view all
+      <strong style="color:var(--text)">keyboard shortcuts</strong>.
+    </p>
+    <div style="display:flex;gap:.5rem;justify-content:flex-end">
+      <button id="welcomeShortcuts" style="font-family:Outfit;font-size:.78rem;font-weight:600;padding:.45rem .9rem;border-radius:99px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer">Show shortcuts</button>
+      <button id="welcomeClose" style="font-family:Outfit;font-size:.78rem;font-weight:600;padding:.45rem .9rem;border-radius:99px;border:none;background:var(--acc);color:#fff;cursor:pointer">Got it</button>
+    </div>
+  </div>
+</div>
+
+<!-- Drop zone -->
+<div id="dz">
+  <div class="di">🖼️</div><div class="dt">Drop image here</div><div class="ds">PNG · JPG · WebP</div>
+</div>
+
+<div id="tst"></div>
+
+<script>
+"use strict";
+// ──────────────────────────────────────────────────────────────────────────
+//  Mouse button icon SVGs — embedded so the shortcuts popup can show LMB /
+//  RMB / MMB glyphs without an external icon font.
+// ──────────────────────────────────────────────────────────────────────────
+const LMB=`<svg viewBox="0 0 11 15"><rect x=".6" y=".6" width="9.8" height="13.8" rx="2.2" stroke-width="1.1"/><line x1="5.5" y1=".6" x2="5.5" y2="6.8" stroke-width="1.1"/><rect x=".6" y=".6" width="4.9" height="6.2" rx="1.6" fill="currentColor" opacity=".55" stroke="none"/></svg>`;
+const RMB=`<svg viewBox="0 0 11 15"><rect x=".6" y=".6" width="9.8" height="13.8" rx="2.2" stroke-width="1.1"/><line x1="5.5" y1=".6" x2="5.5" y2="6.8" stroke-width="1.1"/><rect x="5.5" y=".6" width="4.9" height="6.2" rx="1.6" fill="currentColor" opacity=".55" stroke="none"/></svg>`;
+const MMB=`<svg viewBox="0 0 11 15"><rect x=".6" y=".6" width="9.8" height="13.8" rx="2.2" stroke-width="1.1"/><rect x="4.2" y="2" width="2.6" height="5" rx="1.3" fill="currentColor" opacity=".55" stroke="none"/></svg>`;
+// Drag pictograms.
+//   DRAG_HORIZ — mouse + ↔ arrow.  For horizontal-drag actions (depth, slide).
+//   DRAG_RECT  — dashed selection marquee with diagonal corner arrow.
+//                For "drag a rectangle" / area-selection actions.
+const DRAG=`<span class="di-drag"><svg viewBox="0 0 24 14"><rect x="1" y="2" width="6" height="10" rx="2"/><line x1="4" y1="2" x2="4" y2="6.5"/><rect x="1" y="2" width="3" height="4.5" rx="1.2" fill="currentColor" opacity=".55" stroke="none"/><line x1="10" y1="7" x2="22" y2="7"/><polyline points="12.5,4 9.5,7 12.5,10"/><polyline points="19.5,4 22.5,7 19.5,10"/></svg></span>`;
+const DRAG_RECT=`<span class="di-drag"><svg viewBox="0 0 22 14"><rect x="2" y="1.5" width="12" height="9" rx=".5" stroke-dasharray="2.4,1.6" stroke-width="1.3"/><line x1="14" y1="10.5" x2="19.5" y2="13.5" stroke-width="1.25"/><polyline points="17.6,13.5 19.5,13.5 18.9,11.6" stroke-width="1.25"/></svg></span>`;
+// ══════════════════════════════════════════════════════════
+//  CONSTANTS — exact from demo
+// ══════════════════════════════════════════════════════════
+const FACE_COLORS={front:[255,80,80],back:[80,255,80],top:[80,80,255],bottom:[255,255,80],left:[255,80,255],right:[80,255,255]};
+const GREY_BG=[231,231,231];
+const FILL_ALPHA=0.20,FILL_BASE=128;
+const FLOOR_BC1=[0.55,0.52,0.48],FLOOR_BC2=[0.30,0.28,0.26],FLOOR_GREYS=[0.15,0.30,0.45];
+const DIM_COLOR={w:"#4070ee",h:"#38a860",d:"#c89030"};
+const BOX_COLORS=["#e04040","#40a0e0","#e0a040","#40e080","#c040e0","#e04080","#40e0e0","#a0e040"];
+const FACE_INDICES=[[0,1,2,3],[4,5,6,7],[0,4,5,1],[1,5,6,2],[2,6,7,3],[3,7,4,0]];
+const EDGE_DEFS=[[0,1,"w"],[3,2,"w"],[4,5,"w"],[7,6,"w"],[0,3,"h"],[1,2,"h"],[4,7,"h"],[5,6,"h"],[0,4,"d"],[1,5,"d"],[2,6,"d"],[3,7,"d"]];
+const KBD_STEP=5,ROT_STEP=0.04;
+
+// ══════════════════════════════════════════════════════════
+//  MATH — exact from demo
+// ══════════════════════════════════════════════════════════
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const scl=(a,s)=>[a[0]*s,a[1]*s,a[2]*s];
+const vlen=a=>Math.sqrt(dot(a,a));
+function norm(a){const l=vlen(a);return l<1e-8?[0,0,0]:[a[0]/l,a[1]/l,a[2]/l];}
+function clip01(v){return Math.max(0,Math.min(1,v));}
+function srgb(c){c=clip01(c);return c<=0.0031308?12.92*c:1.055*Math.pow(c,1/2.4)-0.055;}
+function rotMat(yaw,pitch,roll){const[cy,sy]=[Math.cos(yaw),Math.sin(yaw)],[cp,sp]=[Math.cos(pitch),Math.sin(pitch)],[cr,sr]=[Math.cos(roll),Math.sin(roll)];return[[cy*cp,cy*sp*sr-sy*cr,cy*sp*cr+sy*sr],[sy*cp,sy*sp*sr+cy*cr,sy*sp*cr-cy*sr],[-sp,cp*sr,cp*cr]];}
+function decomposeRot(R){const pitch=Math.asin(Math.max(-1,Math.min(1,-R[2][0]))),cp=Math.cos(pitch);let yaw,roll;if(Math.abs(cp)>1e-6){yaw=Math.atan2(R[1][0],R[0][0]);roll=Math.atan2(R[2][1],R[2][2]);}else{yaw=Math.atan2(-R[0][1],R[1][1]);roll=0;}return{yaw,pitch,roll};}
+function mul3(A,B){const R=[[0,0,0],[0,0,0],[0,0,0]];for(let i=0;i<3;i++)for(let j=0;j<3;j++)for(let k=0;k<3;k++)R[i][j]+=A[i][k]*B[k][j];return R;}
+function rotAxis(axis,angle){const[x,y,z]=norm(axis),c=Math.cos(angle),s=Math.sin(angle),t=1-c;return[[t*x*x+c,t*x*y-s*z,t*x*z+s*y],[t*x*y+s*z,t*y*y+c,t*y*z-s*x],[t*x*z-s*y,t*y*z+s*x,t*z*z+c]];}
+function applyLocalRot(p,axis,angle){return decomposeRot(mul3(rotMat(p.yaw,p.pitch,p.roll),rotAxis(axis,angle)));}
+function sceneCentroid(bxs){if(!bxs.length)return[0,0,0];let sx=0,sy=0,sz=0;for(const b of bxs){sx+=b.cx;sy+=b.cy;sz+=b.cz;}return[sx/bxs.length,sy/bxs.length,sz/bxs.length];}
+function rotateScene(bxs,fl,R,pivot){const[px,py,pz]=pivot;const nb=bxs.map(b=>{const x=b.cx-px,y=b.cy-py,z=b.cz-pz,nx=R[0][0]*x+R[0][1]*y+R[0][2]*z+px,ny=R[1][0]*x+R[1][1]*y+R[1][2]*z+py,nz=R[2][0]*x+R[2][1]*y+R[2][2]*z+pz,dec=decomposeRot(mul3(R,rotMat(b.yaw,b.pitch,b.roll)));return{...b,cx:nx,cy:ny,cz:nz,...dec};});const fd=decomposeRot(mul3(R,rotMat(fl.yaw||0,fl.pitch||0,fl.roll||0)));return{boxes:nb,floor:{...fl,...fd}};}
+
+// ══════════════════════════════════════════════════════════
+//  GEOMETRY
+// ══════════════════════════════════════════════════════════
+function boxVerts(p){const hw=p.w/2,hh=p.h/2,hd=p.d/2,R=rotMat(p.yaw,p.pitch,p.roll);return[[-hw,-hh,-hd],[hw,-hh,-hd],[hw,hh,-hd],[-hw,hh,-hd],[-hw,-hh,hd],[hw,-hh,hd],[hw,hh,hd],[-hw,hh,hd]].map(([x,y,z])=>[R[0][0]*x+R[0][1]*y+R[0][2]*z+p.cx,R[1][0]*x+R[1][1]*y+R[1][2]*z+p.cy,R[2][0]*x+R[2][1]*y+R[2][2]*z+p.cz]);}
+// Pin the projection to an offset camera so cam-pan actually pans the camera
+// (boxes & floor stay in world; the view shifts).  camOffset is set in CSS-px.
+let camOffsetX = 0, camOffsetY = 0;
+// Cumulative camera orbit since centre. We apply orbits to boxes/floor via
+// rotateScene, so to "re-centre" we replay the inverse of viewR on the
+// current scene to bring it back to the initial 3/4 view.
+let viewR = [[1,0,0],[0,1,0],[0,0,1]];
+function proj(v,fov,cw,ch,cd){
+  const f = fov / Math.max(cd - v[2], 0.01);
+  return [ cw/2 - camOffsetX + v[0]*f,
+           ch/2 - camOffsetY - v[1]*f ];
+}
+function boxCtr(b){return boxVerts(b).reduce((a,v)=>[a[0]+v[0]/8,a[1]+v[1]/8,a[2]+v[2]/8],[0,0,0]);}
+// Auto-fit the floor under all boxes, in the FLOOR's local frame so the
+// result is invariant to camera orbit (orbit rotates the world, which would
+// otherwise change box X/Y/Z and shift the auto-fit).
+function computeAutoFloor(currentFloor, padFrac=0.5){
+  if(!boxes.length)return null;
+  const fx = currentFloor.x||0, fy = currentFloor.y, fz = currentFloor.z||0;
+  const R = rotMat(currentFloor.yaw||0, currentFloor.pitch||0, currentFloor.roll||0);
+  // Map a world vertex into the floor's local frame: l = R^T * (v - floor_origin)
+  const toLocal = (v) => {
+    const dx = v[0]-fx, dy = v[1]-fy, dz = v[2]-fz;
+    return [
+      R[0][0]*dx + R[1][0]*dy + R[2][0]*dz,
+      R[0][1]*dx + R[1][1]*dy + R[2][1]*dz,
+      R[0][2]*dx + R[1][2]*dy + R[2][2]*dz,
+    ];
+  };
+  let minX=Infinity, maxX=-Infinity, minZ=Infinity, maxZ=-Infinity, minY=Infinity;
+  for(const b of boxes) for(const v of boxVerts(b)){
+    const l = toLocal(v);
+    if(l[0]<minX)minX=l[0]; if(l[0]>maxX)maxX=l[0];
+    if(l[2]<minZ)minZ=l[2]; if(l[2]>maxZ)maxZ=l[2];
+    if(l[1]<minY)minY=l[1];
+  }
+  const side = Math.max(maxX-minX, maxZ-minZ, 60) * (1 + padFrac*2);
+  // Centre the floor's local origin under the boxes (mid X/Z) and drop it
+  // by minY so the plane sits just under the lowest box vertex.
+  const lx = (minX+maxX)/2, ly = minY - 1, lz = (minZ+maxZ)/2;
+  // Convert that local offset back to world by applying R
+  const newFx = fx + R[0][0]*lx + R[0][1]*ly + R[0][2]*lz;
+  const newFy = fy + R[1][0]*lx + R[1][1]*ly + R[1][2]*lz;
+  const newFz = fz + R[2][0]*lx + R[2][1]*ly + R[2][2]*lz;
+  return {
+    ...currentFloor,
+    show: true, infinite: false,
+    x: Math.round(newFx), y: Math.round(newFy), z: Math.round(newFz),
+    w: Math.round(side), d: Math.round(side),
+    step: Math.max(10, Math.round(side/8)),
+  };
+}
+
+// ══════════════════════════════════════════════════════════
+//  RENDERING — exact from demo
+// ══════════════════════════════════════════════════════════
+function stripeColors(g){const sf=g/0.3;return[FLOOR_BC1.map(c=>Math.round(srgb(c*sf)*255)),FLOOR_BC2.map(c=>Math.round(srgb(c*sf)*255))];}
+function drawFloor(ctx,cw,ch,fov,cd,fl,alpha=1){
+  if(!fl.show)return;
+  const{y:fy,w:fw,d:fd,step,yaw,pitch,roll,infinite:inf}=fl,R=rotMat(yaw||0,pitch||0,roll||0),near=0.3;
+  const fx=fl.x||0, fz=fl.z||0;
+  const toW=(lx,ly,lz)=>[
+    R[0][0]*lx+R[0][1]*ly+R[0][2]*lz + fx,
+    R[1][0]*lx+R[1][1]*ly+R[1][2]*lz + fy,
+    R[2][0]*lx+R[2][1]*ly+R[2][2]*lz + fz
+  ];
+  const a=v=>alpha>=1?`rgb(${v})`:`rgba(${v},${alpha})`;
+  const uw=inf?fw*14:fw,ud=inf?fd*14:fd,hw=uw/2,hd=ud/2,cs=Math.max(5,step),nX=Math.ceil(uw/cs);
+  for(let s=0;s<3;s++){const[c1,c2]=stripeColors(FLOOR_GREYS[s]),sd=ud/3,zN=hd-s*sd,zF=hd-(s+1)*sd,nZ=Math.ceil(sd/cs),jOff=inf?0:Math.floor((hd-zN)/cs);for(let i=0;i<nX;i++){const x0=-hw+i*cs,x1=Math.min(-hw+(i+1)*cs,hw);for(let j=0;j<nZ;j++){const czn=zN-j*cs,czf=Math.max(zN-(j+1)*cs,zF);if(czn<=czf)continue;const c=((i+j+jOff)&1)===0?c1:c2;const pts=[toW(x0,0,czf),toW(x1,0,czf),toW(x1,0,czn),toW(x0,0,czn)];if(pts.some(p=>cd-p[2]<near))continue;const pp=pts.map(v=>proj(v,fov,cw,ch,cd));ctx.beginPath();ctx.moveTo(pp[0][0],pp[0][1]);for(let k=1;k<4;k++)ctx.lineTo(pp[k][0],pp[k][1]);ctx.closePath();ctx.fillStyle=a(c);ctx.fill();}}}
+}
+function faceColor(fd,R){const fw=norm([R[0][2],R[1][2],R[2][2]]),up=norm([R[0][1],R[1][1],R[2][1]]),rt=norm([R[0][0],R[1][0],R[2][0]]);const axes=[{ax:fw,col:FACE_COLORS.front},{ax:scl(fw,-1),col:FACE_COLORS.back},{ax:up,col:FACE_COLORS.top},{ax:scl(up,-1),col:FACE_COLORS.bottom},{ax:rt,col:FACE_COLORS.right},{ax:scl(rt,-1),col:FACE_COLORS.left}];let best=-2,col=FACE_COLORS.front;for(const{ax,col:c}of axes){const d=dot(fd,ax);if(d>best){best=d;col=c;}}return col;}
+function visibleFaces(v3,v2,cd,p){const cam=[0,0,cd],ctr=v3.reduce((a,v)=>[a[0]+v[0]/8,a[1]+v[1]/8,a[2]+v[2]/8],[0,0,0]),R=rotMat(p.yaw,p.pitch,p.roll),faces=[];for(const fIdx of FACE_INDICES){const vW=fIdx.map(i=>v3[i]),fc=vW.reduce((a,v)=>[a[0]+v[0]/4,a[1]+v[1]/4,a[2]+v[2]/4],[0,0,0]);let fn=cross(sub(vW[1],vW[0]),sub(vW[3],vW[0]));if(vlen(fn)<1e-8)continue;fn=norm(fn);if(dot(fn,sub(fc,ctr))<0)fn=scl(fn,-1);const vv=sub(cam,fc);if(dot(vv,fn)<=0)continue;faces.push({depth:vlen(vv),poly:fIdx.map(i=>v2[i]),color:faceColor(norm(sub(fc,ctr)),R)});}return faces.sort((a,b)=>b.depth-a.depth);}
+function drawBox(ctx,cw,ch,p,fov,cd){const v3=boxVerts(p),v2=v3.map(v=>proj(v,fov,cw,ch,cd)),faces=visibleFaces(v3,v2,cd,p);const poly=(f,fn)=>{ctx.beginPath();ctx.moveTo(f.poly[0][0],f.poly[0][1]);for(let i=1;i<f.poly.length;i++)ctx.lineTo(f.poly[i][0],f.poly[i][1]);ctx.closePath();fn(f);};for(const f of faces)poly(f,()=>{ctx.fillStyle=`rgb(${FILL_BASE},${FILL_BASE},${FILL_BASE})`;ctx.fill();});for(const f of faces)poly(f,()=>{const[r,g,b]=f.color;ctx.fillStyle=`rgba(${r},${g},${b},${FILL_ALPHA})`;ctx.fill();});for(const f of faces)poly(f,()=>{ctx.strokeStyle="#000";ctx.lineWidth=1;ctx.stroke();});return{v2,v3,faces};}
+function drawBoxTranslucent(ctx,cw,ch,p,fov,cd,alpha){const v3=boxVerts(p),v2=v3.map(v=>proj(v,fov,cw,ch,cd)),faces=visibleFaces(v3,v2,cd,p);for(const f of faces){const[r,g,b]=f.color;ctx.beginPath();ctx.moveTo(f.poly[0][0],f.poly[0][1]);for(let i=1;i<f.poly.length;i++)ctx.lineTo(f.poly[i][0],f.poly[i][1]);ctx.closePath();ctx.fillStyle=`rgba(${r},${g},${b},${alpha})`;ctx.fill();ctx.strokeStyle="#000";ctx.lineWidth=1;ctx.stroke();}return{v2,v3,faces};}
+function buildMask(d,w,h){const m=new Uint8Array(w*h);for(let i=0;i<w*h;i++)if(d[i*4+3]>0)m[i]=1;return m;}
+function renderBoxesOpaque(ctx,cw,ch,bxs,fov,cd,aIdx,outline,dOrder){
+  if(!bxs.length)return[];
+  const cam=[0,0,cd];
+  const order=dOrder&&dOrder.length===bxs.length?dOrder:[...bxs.map((_,i)=>i)].sort((a,b)=>vlen(sub(cam,boxCtr(bxs[a])))-vlen(sub(cam,boxCtr(bxs[b]))));
+  const res=ctx.getImageData(0,0,cw,ch),occ=new Uint8Array(cw*ch),geo=new Array(bxs.length);
+  for(const i of order){const b=bxs[i],off=Object.assign(document.createElement("canvas"),{width:cw,height:ch});geo[i]=drawBox(off.getContext("2d"),cw,ch,b,fov,cd);const imgd=off.getContext("2d").getImageData(0,0,cw,ch),mask=buildMask(imgd.data,cw,ch);for(let k=0;k<cw*ch;k++){if(mask[k]&&!occ[k]){const si=k*4,sa=imgd.data[si+3]/255;if(sa>0){res.data[si]=Math.round(imgd.data[si]*sa+res.data[si]*(1-sa));res.data[si+1]=Math.round(imgd.data[si+1]*sa+res.data[si+1]*(1-sa));res.data[si+2]=Math.round(imgd.data[si+2]*sa+res.data[si+2]*(1-sa));res.data[si+3]=255;}}}for(let k=0;k<cw*ch;k++)if(mask[k])occ[k]=1;}
+  ctx.putImageData(res,0,0);
+  if(outline&&aIdx>=0&&geo[aIdx]){const{v2}=geo[aIdx];let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;for(const[px,py]of v2){x0=Math.min(x0,px);y0=Math.min(y0,py);x1=Math.max(x1,px);y1=Math.max(y1,py);}ctx.strokeStyle="rgba(192,96,74,.6)";ctx.lineWidth=1.5;ctx.setLineDash([4,3]);ctx.strokeRect(x0-5,y0-5,x1-x0+10,y1-y0+10);ctx.setLineDash([]);}
+  return geo;
+}
+function renderBoxesTranslucent(ctx,cw,ch,bxs,fov,cd,aIdx,outline,alpha,dOrder){
+  if(!bxs.length)return[];
+  const cam=[0,0,cd];
+  const order=dOrder&&dOrder.length===bxs.length?dOrder:[...bxs.map((_,i)=>i)].sort((a,b)=>vlen(sub(cam,boxCtr(bxs[b])))-vlen(sub(cam,boxCtr(bxs[a]))));
+  const geo=new Array(bxs.length);
+  for(const i of order)geo[i]=drawBoxTranslucent(ctx,cw,ch,bxs[i],fov,cd,alpha);
+  if(outline&&aIdx>=0&&geo[aIdx]){const{v2}=geo[aIdx];let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;for(const[px,py]of v2){x0=Math.min(x0,px);y0=Math.min(y0,py);x1=Math.max(x1,px);y1=Math.max(y1,py);}ctx.strokeStyle="rgba(192,96,74,.55)";ctx.lineWidth=1.5;ctx.setLineDash([4,3]);ctx.strokeRect(x0-5,y0-5,x1-x0+10,y1-y0+10);ctx.setLineDash([]);}
+  return geo;
+}
+
+// ══════════════════════════════════════════════════════════
+//  INTERACTION HELPERS
+// ══════════════════════════════════════════════════════════
+function nearestVert(mx,my,v2){let bi=-1,bd=Infinity;for(let i=0;i<v2.length;i++){const d=(v2[i][0]-mx)**2+(v2[i][1]-my)**2;if(d<bd){bd=d;bi=i;}}return{idx:bi,dist:Math.sqrt(bd)};}
+function distToSegment(mx,my,ax,ay,bx,by){const dx=bx-ax,dy=by-ay,len2=dx*dx+dy*dy;if(len2<0.01)return{dist:Math.sqrt((mx-ax)**2+(my-ay)**2),t:0};const t=Math.max(0,Math.min(1,((mx-ax)*dx+(my-ay)*dy)/len2));return{dist:Math.sqrt((mx-(ax+t*dx))**2+(my-(ay+t*dy))**2),t};}
+function nearestEdge(mx,my,v2){let best=null,bd=Infinity;for(let i=0;i<EDGE_DEFS.length;i++){const[a,b,dim]=EDGE_DEFS[i];const{dist,t}=distToSegment(mx,my,v2[a][0],v2[a][1],v2[b][0],v2[b][1]);if(dist<bd){bd=dist;best={edgeIdx:i,dim,dist,a,b,t};}}return best;}
+function boxScreenRadius(v2){let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;for(const[px,py]of v2){x0=Math.min(x0,px);y0=Math.min(y0,py);x1=Math.max(x1,px);y1=Math.max(y1,py);}return Math.sqrt((x1-x0)**2+(y1-y0)**2)/2;}
+function hAlpha(d,show,full){if(d>show)return 0;if(d<full)return 1;return 1-(d-full)/(show-full);}
+
+function drawEdgeHandles(ctx,v2,mx,my,activeEdge=-1){
+  const bsr=boxScreenRadius(v2),edgeZone=Math.max(9,bsr*0.07);
+  for(let i=0;i<EDGE_DEFS.length;i++){
+    const[a,b,dim]=EDGE_DEFS[i];
+    const ax=v2[a][0],ay=v2[a][1],bx2=v2[b][0],by2=v2[b][1];
+    const{dist}=distToSegment(mx,my,ax,ay,bx2,by2);
+    const isA=i===activeEdge,alpha=isA?1:hAlpha(dist,edgeZone*2.2,edgeZone*0.5);
+    if(alpha<=0)continue;
+    const ex=bx2-ax,ey=by2-ay,elen=Math.sqrt(ex*ex+ey*ey);
+    ctx.save();ctx.globalAlpha=alpha;ctx.strokeStyle=DIM_COLOR[dim];ctx.lineWidth=isA?4.5:2.5;ctx.lineCap="round";
+    ctx.beginPath();ctx.moveTo(ax,ay);ctx.lineTo(bx2,by2);ctx.stroke();
+    if((dist<edgeZone*1.8||isA)&&elen>18){
+      const mpx=(ax+bx2)/2,mpy=(ay+by2)/2,nx=ex/elen,ny=ey/elen,al=Math.min(8,elen*.12),aw=3;
+      ctx.lineWidth=isA?2:1.5;ctx.beginPath();
+      ctx.moveTo(mpx+nx*4,mpy+ny*4);ctx.lineTo(mpx+nx*(4+al),mpy+ny*(4+al));
+      ctx.moveTo(mpx+nx*(4+al),mpy+ny*(4+al));ctx.lineTo(mpx+nx*(4+al)-nx*aw+ny*aw,mpy+ny*(4+al)-ny*aw-nx*aw);
+      ctx.moveTo(mpx+nx*(4+al),mpy+ny*(4+al));ctx.lineTo(mpx+nx*(4+al)-nx*aw-ny*aw,mpy+ny*(4+al)-ny*aw+nx*aw);
+      ctx.moveTo(mpx-nx*4,mpy-ny*4);ctx.lineTo(mpx-nx*(4+al),mpy-ny*(4+al));
+      ctx.moveTo(mpx-nx*(4+al),mpy-ny*(4+al));ctx.lineTo(mpx-nx*(4+al)+nx*aw+ny*aw,mpy-ny*(4+al)+ny*aw-nx*aw);
+      ctx.moveTo(mpx-nx*(4+al),mpy-ny*(4+al));ctx.lineTo(mpx-nx*(4+al)+nx*aw-ny*aw,mpy-ny*(4+al)+ny*aw+nx*aw);
+      ctx.stroke();
+      ctx.fillStyle=DIM_COLOR[dim];ctx.font=`bold ${isA?10:9}px monospace`;
+      ctx.textAlign="center";ctx.textBaseline="middle";
+      ctx.fillText(dim.toUpperCase(),mpx+ny*13,mpy-nx*13);
+    }
+    ctx.restore();
+  }
+  // Nearest corner handle
+  const nv=nearestVert(mx,my,v2);
+  if(nv.dist<Math.min(52,boxScreenRadius(v2)*.55)){
+    const[px,py]=v2[nv.idx],alpha=hAlpha(nv.dist,50,8);
+    if(alpha>0){ctx.save();ctx.globalAlpha=alpha;ctx.beginPath();ctx.arc(px,py,7,0,Math.PI*2);ctx.fillStyle="rgba(255,255,255,.92)";ctx.fill();ctx.strokeStyle="#444";ctx.lineWidth=1.8;ctx.stroke();ctx.restore();}
+  }
+}
+
+// Rotation hint: face tint + curved arrow on hover
+function drawRotateHint(ctx,geo,mx,my,alpha){
+  if(!geo?.faces||alpha<0.02)return;
+  let hovFace=null;
+  for(const f of geo.faces){
+    let ins=false;const p=f.poly;
+    for(let i=0,j=p.length-1;i<p.length;j=i++){
+      if((p[i][1]>my)!==(p[j][1]>my)&&mx<(p[j][0]-p[i][0])*(my-p[i][1])/(p[j][1]-p[i][1])+p[i][0])ins=!ins;
+    }
+    if(ins){hovFace=f;break;}
+  }
+  if(!hovFace)return;
+  // Face centre
+  const fcx=hovFace.poly.reduce((s,pt)=>s+pt[0],0)/hovFace.poly.length;
+  const fcy=hovFace.poly.reduce((s,pt)=>s+pt[1],0)/hovFace.poly.length;
+  // Subtle face tint
+  ctx.save();ctx.globalAlpha=alpha*0.13;
+  ctx.beginPath();ctx.moveTo(hovFace.poly[0][0],hovFace.poly[0][1]);
+  for(let i=1;i<hovFace.poly.length;i++)ctx.lineTo(hovFace.poly[i][0],hovFace.poly[i][1]);
+  ctx.closePath();ctx.fillStyle="#fff";ctx.fill();ctx.restore();
+  // Curved arrow (300° arc + arrowhead)
+  const r=18;
+  ctx.save();ctx.globalAlpha=alpha*0.72;ctx.strokeStyle="#2a2520";ctx.lineWidth=2;ctx.lineCap="round";
+  ctx.beginPath();ctx.arc(fcx,fcy,r,-0.5,Math.PI*1.6);ctx.stroke();
+  const ea=Math.PI*1.6,ax=fcx+r*Math.cos(ea),ay=fcy+r*Math.sin(ea),ta=ea+Math.PI/2,al=6;
+  ctx.beginPath();
+  ctx.moveTo(ax,ay);ctx.lineTo(ax+al*Math.cos(ta-0.45),ay+al*Math.sin(ta-0.45));
+  ctx.moveTo(ax,ay);ctx.lineTo(ax+al*Math.cos(ta+0.45),ay+al*Math.sin(ta+0.45));
+  ctx.stroke();ctx.restore();
+}
+
+function drawBoxOutline(ctx,v2,color,lw,alpha){
+  ctx.save();ctx.strokeStyle=color;ctx.lineWidth=lw;ctx.globalAlpha=alpha;ctx.lineCap="round";
+  EDGE_DEFS.forEach(([a,b])=>{ctx.beginPath();ctx.moveTo(v2[a][0],v2[a][1]);ctx.lineTo(v2[b][0],v2[b][1]);ctx.stroke();});
+  ctx.restore();
+}
+
+function drawAddRect(ctx,x0,y0,x1,y1){
+  ctx.save();ctx.strokeStyle="rgba(61,160,90,.9)";ctx.lineWidth=2;ctx.setLineDash([5,4]);
+  ctx.strokeRect(Math.min(x0,x1),Math.min(y0,y1),Math.abs(x1-x0),Math.abs(y1-y0));
+  ctx.setLineDash([]);ctx.fillStyle="rgba(61,160,90,.07)";
+  ctx.fillRect(Math.min(x0,x1),Math.min(y0,y1),Math.abs(x1-x0),Math.abs(y1-y0));ctx.restore();
+}
+
+function screenRectToBox(x0,y0,x1,y1){
+  const wz=camDist*0.42,dz=camDist-wz,ws=dz/fov;
+  const cx_s=(x0+x1)/2,cy_s=(y0+y1)/2;
+  const wx=(cx_s-cSize[0]/2)*ws,wy=-(cy_s-cSize[1]/2)*ws;
+  const w=Math.max(20,Math.abs(x1-x0)*ws),h=Math.max(20,Math.abs(y1-y0)*ws);
+  const d=Math.max(20,(w+h)*.25);
+  const id=nid++;
+  return{id,cx:wx,cy:wy,cz:wz,w,h,d,yaw:0,pitch:0,roll:0,label:`Box ${id}`};
+}
+
+// ══════════════════════════════════════════════════════════
+//  STATE
+// ══════════════════════════════════════════════════════════
+let nid=1;
+const mkBox=()=>{const id=nid++;return{id,cx:0,cy:50,cz:0,w:140,h:100,d:90,yaw:0,pitch:0,roll:0,label:`Box ${id}`};};
+// Default box (mkBox) has cy:50, h:100 → bottom at y=0. Floor.y=0 → box on floor.
+const DEFAULT_FLOOR={show:true,infinite:false,x:0,y:0,z:0,w:400,d:400,step:40,yaw:0,pitch:0,roll:0};
+let boxes=[mkBox()],aIdx=0,img=null,imgName="scene";
+let cSize=[window.innerWidth,window.innerHeight],imgOrigSize=null;
+let fov=Math.max(cSize[0],cSize[1])*.95,camDist=fov;
+let floor={...DEFAULT_FLOOR},floorAlpha=0.35,boxAlpha=0.18;
+let depthOrder=null,viewMode="normal",xScale=1;
+let ptMode=false,ptPoints=[];   // WildDet3D point prompts, in cSize-space [x,y,label(1=pos,0=neg)]
+// activeMode: null=free | 'T'|'R'|'S'|'C'=locked | 'floor'|'add'=special
+let activeMode=null;
+const addRect={active:false,x0:0,y0:0,x1:0,y1:0};
+let addPhase='idle'; // 'idle'|'draw2d'|'depth_adj'
+let addDepthBase=0,addDepthAnchorX=0;
+
+const drag={active:false,type:"idle",sx:0,sy:0,px:0,py:0,sp:null,bi:0,tgt:"box",pivot:[0,0,0],edgeIdx:-1,dim:"w",floorSp:null};
+let geoRef=[],hoverAction=null,mp={x:-999,y:-999},hovBoxIdx=-1,rotHintAlpha=0;
+const hist={past:[],future:[]};
+const snap=()=>({boxes:JSON.parse(JSON.stringify(boxes)),floor:{...floor},aIdx,fov,camDist});
+const applySnap=s=>{boxes=s.boxes;floor=s.floor;aIdx=Math.min(s.aIdx,s.boxes.length-1);if(s.fov!==undefined)fov=s.fov;if(s.camDist!==undefined)camDist=s.camDist;render();};
+const push=()=>{hist.past.push(snap());hist.future=[];if(hist.past.length>80)hist.past.shift();};
+const undo=()=>{if(!hist.past.length)return;hist.future.push(snap());applySnap(hist.past.pop());};
+const redo=()=>{if(!hist.future.length)return;hist.past.push(snap());applySnap(hist.future.pop());};
+function renumberBoxes(){boxes=boxes.map((b,i)=>({...b,label:`Box ${i+1}`}));}
+
+// ── Depth ordering ──
+function getDepthOrder(){
+  if(depthOrder&&depthOrder.length===boxes.length)return[...depthOrder];
+  return[...boxes.map((_,i)=>i)].sort((a,b)=>
+    vlen(sub([0,0,camDist],boxCtr(boxes[a])))-vlen(sub([0,0,camDist],boxCtr(boxes[b]))));
+}
+window.moveDepth=(boxIdx,dir)=>{
+  push();
+  const order=getDepthOrder();
+  const pos=order.indexOf(boxIdx);if(pos<0)return;
+  const newPos=Math.max(0,Math.min(order.length-1,pos+dir));
+  if(pos===newPos)return;
+  [order[pos],order[newPos]]=[order[newPos],order[pos]];
+  depthOrder=[...order];render();
+};
+window.resetDepth=()=>{push();depthOrder=null;render();toast("Depth auto-sorted");};
+
+// ── Mode hint bar content (one row per mode). Uses LMB/RMB/MMB SVGs and kbd. ──
+function _kb(s){return`<kbd>${s}</kbd>`}
+// Each entry (icon + label / kbd + label / plain text) is wrapped in .mh-item
+// so the flex bar treats it as one inline group that stays aligned.
+function _item(...inner){return `<span class="mh-item">${inner.join("")}</span>`;}
+function _mb(svg, lbl){return _item(`<span class="mb">${svg}</span>`, lbl?`<span>${lbl}</span>`:"");}
+function _kbd(s, lbl){return _item(_kb(s), lbl?`<span>${lbl}</span>`:"");}
+function modeHintHTML(m){
+  if(!m) return "";
+  const sep = `<span class="mh-sep">·</span>`;
+  const dot = `<span class="mh-dot">·</span>`;
+  const ESC = _kbd("Esc","exit");
+  if(m==="T") return `<span class="mh-title">TRANSLATE</span>${dot}`+
+    `${_mb(LMB,"drag move")}${sep}${_kbd("↑↓←→","step")}${sep}${_kbd("Ctrl+↑↓←→","fine")}${sep}${ESC}`;
+  if(m==="R") return `<span class="mh-title">ROTATE</span>${dot}`+
+    `${_mb(LMB,"drag rotate")}${sep}${_kbd("Shift+↑↓←→","yaw/pitch")}${sep}${_kbd("Q/E","roll")}${sep}${ESC}`;
+  if(m==="S") return `<span class="mh-title">SCALE</span>${dot}`+
+    `${_mb(LMB,"drag corner")}${sep}${_mb(MMB,"scroll on box")}${sep}${_kbd("↑↓←→","W/H")}${sep}${_kbd("[ ]","depth")}${sep}${ESC}`;
+  if(m==="C") return `<span class="mh-title">CAMERA</span>${dot}`+
+    `${_mb(LMB,"orbit")}${sep}${_mb(RMB,"pan")}${sep}${_mb(MMB,"scroll zoom")}${sep}${ESC}`;
+  if(m==="floor") return `<span class="mh-title">FLOOR EDIT</span>${dot}`+
+    `${_mb(LMB,"move")}${sep}${_mb(RMB,"rotate")}${sep}${_mb(MMB,"scroll")}/${_kbd("+ -","scale")}${sep}`+
+    `${_kbd("↑↓←→","move")}${sep}${_kbd("[ ]","depth")}${sep}${_kbd("Q/E","roll")}${sep}${ESC}`;
+  if(m==="add") return `<span class="mh-title">ADD BOX</span>${dot}`+
+    `${_item(DRAG_RECT,`<span>drag a rectangle</span>`)}${sep}${_item(DRAG,`<span>drag once to set depth</span>`)}${sep}${ESC}`;
+  if(m==="del") return `<span class="mh-title">DELETE BOX</span>${dot}`+
+    `${_mb(LMB,"click a box to remove it")}${sep}${ESC}`;
+  return "";
+}
+function updateModeHintBar(m){
+  const bar = document.getElementById("modeHintBar");
+  if(!bar) return;
+  const html = modeHintHTML(m);
+  if(html){ bar.innerHTML = html; bar.classList.add("show"); }
+  else    { bar.classList.remove("show"); }
+}
+
+// ──  Single mode setter (mutual exclusion) ──
+function setMode(m){
+  activeMode=m;
+  document.querySelectorAll('.mbtn2[data-mode]').forEach(b=>b.classList.toggle('on',b.dataset.mode===m));
+  const camBtn=document.getElementById('camBtn');if(camBtn)camBtn.classList.toggle('on',m==='C');
+  const flrBtn=document.getElementById('floorBtn');if(flrBtn)flrBtn.classList.toggle('on',m==='floor');
+  // Mode hint bar (replaces the floating "hint" tooltip in every mode but Free)
+  updateModeHintBar(m);
+  const addBtn=document.getElementById('addModeBtn');if(addBtn)addBtn.classList.toggle('on',m==='add');
+  const addH=document.getElementById('addHint');if(addH)addH.style.display=m==='add'?'block':'none';
+  const delBtn=document.getElementById('delBoxBtn');if(delBtn)delBtn.classList.toggle('on',m==='del');
+  const delH=document.getElementById('delHint');if(delH)delH.style.display=m==='del'?'block':'none';
+  if(m!=='add'){addRect.active=false;addPhase='idle';document.getElementById('depthHint').style.display='none';}
+  if(!drag.active)canvas.className='';render();
+}
+const isFloor=()=>activeMode==='floor';
+const isCam=()=>activeMode==='C';
+const isFree=()=>!activeMode||activeMode==='T'||activeMode==='R'||activeMode==='S';
+
+// ══════════════════════════════════════════════════════════
+//  CANVAS + RENDER
+// ══════════════════════════════════════════════════════════
+const canvas=document.getElementById("c"),ctx=canvas.getContext("2d");
+const offCanvas=document.createElement("canvas");
+let displayScale=1,offsetX=0,offsetY=0;
+function toScene(e){const r=canvas.getBoundingClientRect();return[(e.clientX-r.left-offsetX)/displayScale,(e.clientY-r.top-offsetY)/displayScale];}
+
+function render(){
+  canvas.width=window.innerWidth;canvas.height=window.innerHeight;
+  displayScale=Math.min(canvas.width/cSize[0],canvas.height/cSize[1]);
+  offsetX=(canvas.width-cSize[0]*displayScale)/2;
+  offsetY=(canvas.height-cSize[1]*displayScale)/2;
+  offCanvas.width=cSize[0];offCanvas.height=cSize[1];
+  const off=offCanvas.getContext("2d");
+
+  if(viewMode==="boxes_only"||!img){
+    off.fillStyle="#f6f3ee";off.fillRect(0,0,cSize[0],cSize[1]);
+    drawFloor(off,cSize[0],cSize[1],fov,camDist,floor);
+    geoRef=renderBoxesOpaque(off,cSize[0],cSize[1],boxes,fov,camDist,aIdx,true,depthOrder);
+  }else{
+    off.drawImage(img,0,0,cSize[0],cSize[1]);
+    drawFloor(off,cSize[0],cSize[1],fov,camDist,floor,floorAlpha);
+    geoRef=renderBoxesTranslucent(off,cSize[0],cSize[1],boxes,fov,camDist,aIdx,true,boxAlpha,depthOrder);
+  }
+
+  // Empty state prompt
+  if(boxes.length===0){
+    off.save();off.fillStyle="rgba(120,116,108,.5)";off.font="500 16px Outfit,sans-serif";
+    off.textAlign="center";off.textBaseline="middle";
+    off.fillText("No boxes — press ＋ to add one",cSize[0]/2,cSize[1]/2);off.restore();
+  }
+
+  // ── Hover detection: check ALL boxes ──
+  hovBoxIdx=-1;
+  const cam2=[0,0,camDist];
+  // Sort by depth (front-to-back) so nearest box wins
+  const sorted=[...boxes.map((_,i)=>i)].sort((a,b)=>vlen(sub(cam2,boxCtr(boxes[a])))-vlen(sub(cam2,boxCtr(boxes[b]))));
+  for(const bi of sorted){
+    const geo=geoRef[bi];if(!geo?.faces)continue;
+    for(const f of geo.faces){let ins=false;const p=f.poly;for(let i=0,j=p.length-1;i<p.length;j=i++){if((p[i][1]>mp.y)!==(p[j][1]>mp.y)&&mp.x<(p[j][0]-p[i][0])*(mp.y-p[i][1])/(p[j][1]-p[i][1])+p[i][0])ins=!ins;}if(ins){hovBoxIdx=bi;break;}}
+    if(hovBoxIdx>=0)break;
+  }
+
+  // ── Highlight ALL hovered non-active boxes ──
+  for(let bi=0;bi<boxes.length;bi++){
+    if(bi===aIdx)continue;
+    const geo=geoRef[bi];if(!geo?.v2)continue;
+    // Check if this specific box is hovered (not just hovBoxIdx which is the topmost)
+    let isHov=false;
+    for(const f of geo.faces){let ins=false;const p=f.poly;for(let i=0,j=p.length-1;i<p.length;j=i++){if((p[i][1]>mp.y)!==(p[j][1]>mp.y)&&mp.x<(p[j][0]-p[i][0])*(mp.y-p[i][1])/(p[j][1]-p[i][1])+p[i][0])ins=!ins;}if(ins){isHov=true;break;}}
+    if(isHov)drawBoxOutline(off,geo.v2,BOX_COLORS[bi%BOX_COLORS.length],2,0.6);
+  }
+
+  // ── Delete-mode: paint the soon-to-be-deleted box red + swap cursor ──
+  if(activeMode==='del'){
+    if(hovBoxIdx>=0&&geoRef[hovBoxIdx]?.v2){
+      const geo=geoRef[hovBoxIdx];
+      off.save();
+      for(const f of geo.faces){
+        off.beginPath();off.moveTo(f.poly[0][0],f.poly[0][1]);
+        for(let i=1;i<f.poly.length;i++)off.lineTo(f.poly[i][0],f.poly[i][1]);
+        off.closePath();
+        off.fillStyle="rgba(192,96,74,.32)";off.fill();
+      }
+      drawBoxOutline(off,geo.v2,"rgba(192,96,74,.95)",2.8,1);
+      // Small "✕" badge over the box centroid
+      let cx2=0,cy2=0,n=0;for(const v of geo.v2){cx2+=v[0];cy2+=v[1];n++;}
+      cx2/=n;cy2/=n;
+      off.beginPath();off.arc(cx2,cy2,12,0,Math.PI*2);
+      off.fillStyle="rgba(192,96,74,.95)";off.fill();
+      off.fillStyle="#fff";off.font="700 14px Outfit,sans-serif";
+      off.textAlign="center";off.textBaseline="middle";off.fillText("✕",cx2,cy2+1);
+      off.restore();
+      canvas.className="del-c";
+    } else if(!drag.active){
+      canvas.className="cross-c";
+    }
+  }
+
+  // ── Active box handles (mode-aware, exclusive) ──
+  if(aIdx>=0&&aIdx<boxes.length&&geoRef[aIdx]){
+    const{v2}=geoRef[aIdx];
+    const isEdgeDrag=drag.active&&drag.type==="edgescale";
+    const isCornerDrag=drag.active&&drag.type==="scale";
+    const isRotating=drag.active&&drag.type==="rotate";
+
+    // Face-hover rotation hint — curved arrow + face tint
+    const showHint2=(activeMode==='R')||(!activeMode&&hoverAction==="face"&&hovBoxIdx===aIdx);
+    const wantHint=showHint2&&!isEdgeDrag&&!isCornerDrag&&!drag.active?1:0;
+    rotHintAlpha+=(wantHint-rotHintAlpha)*.18;
+    if(rotHintAlpha>0.02)drawRotateHint(off,geoRef[aIdx],mp.x,mp.y,rotHintAlpha);
+
+    // Edge handles — show only in edge-relevant states
+    if((isFree()||(activeMode==='S'))&&(hoverAction?.startsWith("resize-")||isEdgeDrag)){
+      drawEdgeHandles(off,v2,mp.x,mp.y,isEdgeDrag?drag.edgeIdx:-1);
+    }else if(activeMode==='S'||hoverAction==="scale"||isCornerDrag){
+      // Scale: corner handle only
+      const nv=nearestVert(mp.x,mp.y,v2);
+      if(nv.dist<50){const[px,py]=v2[nv.idx],alpha=hAlpha(nv.dist,50,8);if(alpha>0){off.save();off.globalAlpha=alpha;off.beginPath();off.arc(px,py,7,0,Math.PI*2);off.fillStyle="rgba(255,255,255,.92)";off.fill();off.strokeStyle="#444";off.lineWidth=1.8;off.stroke();off.restore();}}
+    }
+
+    // Subtle active box tint
+    if(hovBoxIdx===aIdx&&!drag.active)drawBoxOutline(off,v2,"rgba(192,96,74,.3)",1.5,1);
+  }
+
+  // Floor edit mode overlay
+  if(isFloor()){
+    off.save();off.strokeStyle="rgba(192,150,40,.4)";off.lineWidth=2.5;off.setLineDash([6,4]);
+    off.strokeRect(3,3,cSize[0]-6,cSize[1]-6);off.setLineDash([]);
+    off.fillStyle="rgba(212,190,60,.04)";off.fillRect(0,0,cSize[0],cSize[1]);off.restore();
+  }
+
+  // Camera mode border
+  if(isCam()&&!isFloor()){
+    off.save();off.strokeStyle="rgba(68,112,200,.25)";off.lineWidth=2;off.setLineDash([5,4]);
+    off.strokeRect(3,3,cSize[0]-6,cSize[1]-6);off.setLineDash([]);off.restore();
+  }
+
+  // Add mode rect + crosshair
+  if(activeMode==='add'){
+    if(addRect.active)drawAddRect(off,addRect.x0,addRect.y0,addRect.x1,addRect.y1);
+    else if(addPhase==='idle'&&mp.x>0){
+      off.save();off.strokeStyle="rgba(61,160,90,.8)";off.lineWidth=1.5;
+      off.beginPath();off.moveTo(mp.x-13,mp.y);off.lineTo(mp.x+13,mp.y);off.moveTo(mp.x,mp.y-13);off.lineTo(mp.x,mp.y+13);off.stroke();off.restore();
+    }
+  }
+
+  ctx.fillStyle="#dedad4";ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(offCanvas,offsetX,offsetY,cSize[0]*displayScale,cSize[1]*displayScale);
+  for(const [x,y,l] of ptPoints){const sx=offsetX+x*displayScale,sy=offsetY+y*displayScale;
+    ctx.beginPath();ctx.arc(sx,sy,7,0,Math.PI*2);ctx.fillStyle=l?"#31c48d":"#e02424";ctx.fill();
+    ctx.lineWidth=2.5;ctx.strokeStyle="#fff";ctx.stroke();}
+  updateBoxList();
+
+}
+window.addEventListener("resize",()=>render());
+
+// ══════════════════════════════════════════════════════════
+//  HOVER ACTION DETECTION
+// ══════════════════════════════════════════════════════════
+function getHoverAction(mx,my){
+  if(isFloor())return"floor_edit";
+  if(isCam())return"orbit";
+  if(activeMode==='add')return"add";
+  if(activeMode==='T')return"face_T";
+  if(activeMode==='R')return"face_R";
+  if(activeMode==='S'){
+    // In S mode: still show edge/corner hints for visual feedback
+    const g2=geoRef[aIdx];if(g2&&hovBoxIdx===aIdx){
+      const bsr2=boxScreenRadius(g2.v2);
+      if(nearestVert(mx,my,g2.v2).dist<Math.max(10,bsr2*.09))return"scale";
+      const ne2=nearestEdge(mx,my,g2.v2);
+      if(ne2&&ne2.dist<Math.max(8,bsr2*.065))return`resize-${ne2.dim}`;
+    }
+    return"scale";
+  }
+  const geo=geoRef[aIdx];
+  if(!geo||hovBoxIdx!==aIdx){
+    return hovBoxIdx>=0?"select_box":null;
+  }
+  const{v2}=geo,bsr=boxScreenRadius(v2);
+  const cornerR=Math.max(10,bsr*.09);
+  if(nearestVert(mx,my,v2).dist<cornerR)return"scale";
+  const edgeR=Math.max(8,bsr*.065);
+  const ne=nearestEdge(mx,my,v2);
+  if(ne&&ne.dist<edgeR)return`resize-${ne.dim}`;
+  for(const f of geo.faces){let ins=false;const p=f.poly;for(let i=0,j=p.length-1;i<p.length;j=i++){if((p[i][1]>my)!==(p[j][1]>my)&&mx<(p[j][0]-p[i][0])*(my-p[i][1])/(p[j][1]-p[i][1])+p[i][0])ins=!ins;}if(ins)return"face";}
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════
+//  CURSOR + HINT (with mouse button icons)
+// ══════════════════════════════════════════════════════════
+function updateCursor(action){
+  canvas.className='';
+  const m=canvas.classList;
+  if(!action)return;
+  if(action==="orbit"||action==="face"||action==="face_T"||action==="floor_edit"||action==="select_box"||action==="over_floor")m.add("move-c");
+  else if(action==="face_R")m.add("grab-c");
+  else if(action==="scale")m.add("nesw-r");
+  else if(action==="resize-w")m.add("ew-r");
+  else if(action==="resize-h")m.add("ns-r");
+  else if(action==="resize-d")m.add("nesw-r");
+  else if(action==="add")m.add("cross-c");
+  else m.add("grab-c");
+}
+function showHint(action,ex,ey){
+  const h=document.getElementById("hint");
+  if(drag.active){h.style.display="none";return;}
+  // Suppress the floating tooltip whenever a mode is active — the mode-hint
+  // bar at the top of the screen already explains the controls.
+  if(activeMode){h.style.display="none";return;}
+  if(!action){
+    // Free-mode tooltip on empty-space hover
+    h.style.display="block";
+    h.innerHTML=`Alt+${LMB} Orbit  ·  Alt+${RMB} Pan<br><span style="opacity:.65;font-size:.64rem">⌨ Camera mode (C) for full camera control</span>`;
+    h.style.left=(ex+16)+"px";h.style.top=(ey-14)+"px";
+    return;
+  }
+  const hints={
+    "orbit":`${LMB} Orbit  ·  ${RMB} Pan<br><span style="opacity:.65;font-size:.64rem">⌨ Shift+↑↓←→ rotates scene  ·  Q/E rolls</span>`,
+    "cam_pan":`${LMB} Pan  ·  ${RMB} Pan`,
+    "scale":`${LMB}${DRAG}corner: Scale<br><span style="opacity:.65;font-size:.64rem">⌨ Scroll on box to scale</span>`,
+    "resize-w":`${LMB}${DRAG}edge: Width<br><span style="opacity:.65;font-size:.64rem">⌨ ← → arrow keys</span>`,
+    "resize-h":`${LMB}${DRAG}edge: Height<br><span style="opacity:.65;font-size:.64rem">⌨ ↑ ↓ arrow keys</span>`,
+    "resize-d":`${LMB}${DRAG}edge: Depth<br><span style="opacity:.65;font-size:.64rem">⌨ [ and ] keys</span>`,
+    "face":`${LMB} Move  ·  ${RMB} Rotate  ·  ${MMB} Orbit<br><span style="opacity:.65;font-size:.64rem">⌨ Ctrl+↑↓←→ move  ·  Shift+↑↓←→ rotate  ·  Q/E roll</span>`,
+    "face_T":`${LMB} Translate (T locked)<br><span style="opacity:.65;font-size:.64rem">⌨ Ctrl+arrows</span>`,
+    "face_R":`${LMB} Rotate (R locked)<br><span style="opacity:.65;font-size:.64rem">⌨ Shift+arrows  ·  Q/E roll</span>`,
+    "floor_edit":`${LMB} Move floor  ·  ${RMB} Tilt floor<br><span style="opacity:.65;font-size:.64rem">⌨ ↑↓ move  ·  Shift+↑↓←→ tilt  ·  Esc: exit</span>`,
+    "select_box":`${LMB} Click to select`,
+    "add":`${LMB} Drag: Draw box footprint<br><span style="opacity:.65;font-size:.64rem">Then drag horizontally to set depth</span>`,
+  };
+  const txt=hints[action];if(!txt){h.style.display="none";return;}
+  h.style.display="block";h.innerHTML=txt;
+  h.style.left=(ex+16)+"px";h.style.top=(ey-14)+"px";
+}
+
+// ══════════════════════════════════════════════════════════
+//  MOUSE EVENTS
+// ══════════════════════════════════════════════════════════
+canvas.addEventListener("mousedown",e=>{
+  if(ptMode){e.preventDefault();
+    if(e.button===0){const[px,py]=toScene(e);ptPoints.push([px,py,e.shiftKey?0:1]);updatePtBar();render();}
+    else if(e.button===2){ // right-click removes the nearest placed point
+      const[px,py]=toScene(e);let best=-1,bd=1e9;
+      ptPoints.forEach((p,i)=>{const d=Math.hypot(p[0]-px,p[1]-py);if(d<bd){bd=d;best=i;}});
+      if(best>=0&&bd<32){ptPoints.splice(best,1);updatePtBar();render();toast("Point removed");}
+    }
+    return;}
+  e.preventDefault();closePopups();
+  const[mx,my]=toScene(e);
+  const isRight=e.button===2,isLeft=e.button===0,isMid=e.button===1;
+  const altOrMid=e.altKey||isMid;
+
+  // Alt/middle drag = camera orbit in ANY mode
+  if(altOrMid){
+    // Alt+L = orbit, Alt+R = pan (works in any mode)
+    push();drag.sx=mx;drag.sy=my;drag.px=mx;drag.py=my;drag.pivot=sceneCentroid(boxes);drag.tgt="scene";drag.active=true;
+    drag.type=isRight?"cam_pan":"cam_orbit";    canvas.className=isRight?"move-c":"grabbing";return;
+  }
+
+  // Delete-box mode: click a box to remove it
+  if(activeMode==='del'&&isLeft){
+    for(let bi=0;bi<boxes.length;bi++){
+      const g=geoRef[bi]; if(!g?.faces) continue;
+      for(const fa of g.faces){
+        let ins=false; const p=fa.poly;
+        for(let i=0,j=p.length-1;i<p.length;j=i++){
+          if((p[i][1]>my)!==(p[j][1]>my) && mx<(p[j][0]-p[i][0])*(my-p[i][1])/(p[j][1]-p[i][1])+p[i][0]) ins=!ins;
+        }
+        if(ins){
+          const lbl = deleteBoxAt(bi);
+          if(lbl) toast(`Deleted ${lbl}`);
+          if(boxes.length===0) setMode(null);
+          return;
+        }
+      }
+    }
+    return;
+  }
+
+  // Add box mode
+  if(activeMode==='add'&&isLeft){
+    if(addPhase==='depth_adj'){
+      // Confirm depth
+      addPhase='idle';setMode(null);
+      document.getElementById('depthHint').style.display='none';render();return;
+    }
+    addRect.active=true;addRect.x0=mx;addRect.y0=my;addRect.x1=mx;addRect.y1=my;render();return;
+  }
+
+  // Floor edit mode
+  if(isFloor()){
+    push();drag.sx=mx;drag.sy=my;drag.px=mx;drag.py=my;drag.tgt="floor";drag.active=true;
+    drag.type=isRight?"rotate_floor":"move_floor";drag.floorSp={...floor};canvas.className="move-c";return;
+  }
+
+  // Camera mode — L-drag=orbit, R-drag=pan
+  if(isCam()&&!isFloor()){
+    push();drag.sx=mx;drag.sy=my;drag.px=mx;drag.py=my;drag.pivot=sceneCentroid(boxes);drag.tgt="scene";drag.active=true;
+    drag.type=isRight?"cam_pan":"cam_orbit";canvas.className="grabbing";return;
+  }
+
+  // Edge/corner hit on active box (left click)
+  const geo=geoRef[aIdx];
+  if(geo&&isLeft&&activeMode!=='R'){
+    const{v2}=geo;const bsr=boxScreenRadius(v2);
+    if(nearestVert(mx,my,v2).dist<Math.max(10,bsr*.09)&&activeMode!=='T'){
+      push();drag.active=true;drag.type="scale";drag.sx=mx;drag.sy=my;drag.sp={...boxes[aIdx]};drag.bi=aIdx;drag.tgt="box";canvas.className="grabbing";return;
+    }
+    const ne=nearestEdge(mx,my,v2);
+    if(ne&&ne.dist<Math.max(8,bsr*.065)&&activeMode!=='T'){
+      push();drag.active=true;drag.type="edgescale";drag.edgeIdx=ne.edgeIdx;drag.dim=ne.dim;drag.sx=mx;drag.sy=my;drag.sp={...boxes[aIdx]};drag.bi=aIdx;drag.tgt="box";canvas.className="grabbing";return;
+    }
+  }
+
+  // Face hit
+  let hitIdx=-1,hitDepth=Infinity;
+  for(let bi=0;bi<boxes.length;bi++){const g=geoRef[bi];if(!g?.faces)continue;for(const f of g.faces){let ins=false;const p=f.poly;for(let i=0,j=p.length-1;i<p.length;j=i++){if((p[i][1]>my)!==(p[j][1]>my)&&mx<(p[j][0]-p[i][0])*(my-p[i][1])/(p[j][1]-p[i][1])+p[i][0])ins=!ins;}if(ins){const d=vlen(sub([0,0,camDist],boxCtr(boxes[bi])));if(d<hitDepth){hitDepth=d;hitIdx=bi;}}}}
+  if(hitIdx>=0){
+    if(hitIdx!==aIdx){aIdx=hitIdx;render();}
+    push();drag.active=true;
+    if(activeMode==='T')drag.type="move";
+    else if(activeMode==='R')drag.type="rotate";
+    else if(activeMode==='S')drag.type="scale";
+    else drag.type=isRight?"rotate":"move";
+    drag.sx=mx;drag.sy=my;drag.sp={...boxes[hitIdx]};drag.bi=hitIdx;drag.tgt="box";canvas.className="grabbing";
+  }
+});
+
+canvas.addEventListener("mousemove",e=>{
+  const[mx,my]=toScene(e);mp={x:mx,y:my};
+
+  // Depth adjust phase
+  if(activeMode==='add'&&addPhase==='depth_adj'){
+    const dd=(mx-addDepthAnchorX)*2;
+    boxes=boxes.map((b,i)=>i===aIdx?{...b,d:Math.max(10,addDepthBase+dd)}:b);
+    render();return;
+  }
+  if(activeMode==='add'&&addRect.active){addRect.x1=mx;addRect.y1=my;render();return;}
+
+  if(!drag.active){
+    hoverAction=getHoverAction(mx,my);
+    updateCursor(hoverAction);
+    showHint(hoverAction,e.clientX,e.clientY);
+    render();return;
+  }
+
+  const dx=mx-drag.sx,dy=my-drag.sy;
+  const sn=v=>v;   // (snap-to-grid removed — kept as identity for callers)
+
+  if(drag.tgt==="scene"){
+    if(drag.type==="cam_orbit"||drag.type==="rotate"){
+      // Orbit: horizontal=yaw, vertical=pitch (same as box rotation feel)
+      const fdx=mx-drag.px,fdy=my-drag.py;
+      const Ry=rotAxis([0,1,0],fdx*.012),Rx=rotAxis([1,0,0],fdy*.012);
+      const dR=mul3(Rx,Ry);
+      const{boxes:nb,floor:nf}=rotateScene(boxes,floor,dR,drag.pivot);
+      boxes=nb;floor=nf;drag.px=mx;drag.py=my;
+      // Track cumulative camera orbit so we can undo it via Re-centre.
+      // (Free-mode "rotate" rotates a single box, not the whole scene, so
+      // only accumulate when the actual orbit is happening.)
+      if(drag.type==="cam_orbit") viewR = mul3(dR, viewR);
+    }else if(drag.type==="cam_pan"){
+      // True camera pan. Convention: dragging the cursor LEFT moves the
+      // camera LEFT — so the scene appears to slide RIGHT.
+      // pixel_x = cw/2 - camOffsetX + v.x*f → camOffsetX increases as the
+      // camera moves right (cursor right). So camOffsetX += fdx.
+      const fdx = mx - drag.px, fdy = my - drag.py;
+      camOffsetX += fdx;
+      camOffsetY += fdy;
+      drag.px = mx; drag.py = my;
+    }
+  }else if(drag.tgt==="floor"){
+    const sp=drag.floorSp;
+    if(drag.type==="move_floor"){
+      const dx=mx-drag.sx, dy=my-drag.sy;
+      floor={...floor, x:sn((sp.x||0)+dx), y:sn(sp.y-dy)};
+    }
+    else if(drag.type==="rotate_floor"){
+      // Full up/down AND left/right rotation
+      const fdx=mx-drag.px,fdy=my-drag.py;
+      const Ry=rotAxis([0,1,0],fdx*.013),Rx=rotAxis([1,0,0],fdy*.013);
+      const newR=mul3(Rx,mul3(Ry,rotMat(floor.yaw||0,floor.pitch||0,floor.roll||0)));
+      floor={...floor,...decomposeRot(newR)};drag.px=mx;drag.py=my;
+    }
+  }else{
+    const bi=drag.bi,sp=drag.sp;
+    if(drag.type==="rotate"){
+      // World-space pre-multiply: horizontal=always world-Y spin, vertical=always world-X tilt
+      // Pre-multiplying keeps rotation axes fixed to the SCREEN regardless of box orientation
+      const dR=mul3(rotAxis([1,0,0],(my-drag.sy)*0.012),rotAxis([0,1,0],(mx-drag.sx)*0.012));
+      const nr=decomposeRot(mul3(dR,rotMat(sp.yaw,sp.pitch,sp.roll)));
+      boxes=boxes.map((b,i)=>i===bi?{...b,...nr}:b);
+    }
+    else if(drag.type==="move"){boxes=boxes.map((b,i)=>i===bi?{...b,cx:sn(sp.cx+dx),cy:sn(sp.cy-dy)}:b);}
+    else if(drag.type==="scale"){const f=Math.max(.05,1+dx*.004);boxes=boxes.map((b,i)=>i===bi?{...b,w:Math.max(1,sp.w*f),h:Math.max(1,sp.h*f),d:Math.max(1,sp.d*f)}:b);}
+    else if(drag.type==="edgescale"){
+      const gEd=geoRef[bi];
+      if(gEd?.v2){
+        const[va,vb]=EDGE_DEFS[drag.edgeIdx],av=gEd.v2[va],bv=gEd.v2[vb];
+        const ex=bv[0]-av[0],ey=bv[1]-av[1],elen=Math.sqrt(ex*ex+ey*ey);
+        const pd=elen>0.1?(dx*ex+dy*ey)/elen:0;
+        const sign=drag.dim==="d"?-1:1;
+        boxes=boxes.map((b,i)=>i===bi?{...b,[drag.dim]:Math.max(1,sp[drag.dim]+sign*pd*2)}:b);
+      }
+    }
+  }
+  canvas.className="grabbing";render();
+});
+
+canvas.addEventListener("mouseup",e=>{
+  // Finish add-box draw2d
+  if(activeMode==='add'&&addRect.active){
+    const{x0,y0,x1,y1}=addRect;addRect.active=false;
+    if(Math.abs(x1-x0)>10&&Math.abs(y1-y0)>10){
+      push();
+      const nb=screenRectToBox(x0,y0,x1,y1);
+      nb.label=`Box ${boxes.length+1}`;
+      boxes=[...boxes,nb];aIdx=boxes.length-1;
+      // Enter depth adjust phase — swap the step-1 banner for the step-2 one.
+      addPhase='depth_adj';addDepthBase=nb.d;addDepthAnchorX=mp.x;
+      document.getElementById('addHint').style.display='none';
+      document.getElementById('depthHint').style.display='block';
+      canvas.className='ew-r';
+    }else{
+      addPhase='idle';
+    }
+    render();return;
+  }
+  drag.active=false;canvas.className='';render();
+});
+canvas.addEventListener("mouseleave",()=>{drag.active=false;canvas.className='';document.getElementById("hint").style.display="none";render();});
+canvas.addEventListener("contextmenu",e=>e.preventDefault());
+
+canvas.addEventListener("wheel",e=>{
+  e.preventDefault();
+  const[mx,my]=toScene(e);const zoomIn=e.deltaY<0;
+  let overBox=false;
+  for(let bi=0;bi<boxes.length;bi++){const g=geoRef[bi];if(!g?.faces)continue;for(const fa of g.faces){let ins=false;const p=fa.poly;for(let i=0,j=p.length-1;i<p.length;j=i++){if((p[i][1]>my)!==(p[j][1]>my)&&mx<(p[j][0]-p[i][0])*(my-p[i][1])/(p[j][1]-p[i][1])+p[i][0])ins=!ins;}if(ins){overBox=true;break;}}}
+  push();
+  if(isFloor()&&!floor.infinite){
+    // Scale the floor when in floor mode (finite plane only)
+    const f = zoomIn ? 1.06 : 0.943;
+    floor = {
+      ...floor,
+      w: Math.max(20, Math.round(floor.w * f)),
+      d: Math.max(20, Math.round(floor.d * f)),
+      step: Math.max(5, Math.round(floor.step * f)),
+    };
+  } else if(overBox&&!isCam()&&!isFloor()){
+    const f=zoomIn?1.055:.948;
+    boxes=boxes.map((b,i)=>i===aIdx?{...b,w:Math.max(1,b.w*f),h:Math.max(1,b.h*f),d:Math.max(1,b.d*f)}:b);
+  } else {
+    fov=Math.max(100,Math.min(4000,fov*(zoomIn?1.06:.943)));
+  }
+  render();
+},{passive:false});
+
+// ══════════════════════════════════════════════════════════
+//  KEYBOARD
+// ══════════════════════════════════════════════════════════
+window.addEventListener("keydown",e=>{
+  const tag=e.target?.tagName;if(tag==="INPUT"||tag==="TEXTAREA")return;
+  if(e.key==="Escape"){
+    closePopups();
+    if(activeMode){
+      if(activeMode==='add'){ addPhase='idle'; addRect.active=false; }
+      setMode(null);
+      toast("Free mode");
+    }
+    return;
+  }
+  if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&e.key.toLowerCase()==="z"){e.preventDefault();undo();return;}
+  if((e.ctrlKey||e.metaKey)&&(e.key.toLowerCase()==="y"||(e.shiftKey&&e.key.toLowerCase()==="z"))){e.preventDefault();redo();return;}
+
+  // ── Mode-toggle and Save/Open shortcuts run BEFORE any mode-specific
+  // early-returns, so users can switch between modes (incl. Floor) freely.
+  // Shift+I / Shift+O are used for Import/Export — Ctrl+letter combos are
+  // intercepted by browsers, and Ctrl+Alt+letter triggers AltGr on Windows.
+  if(e.shiftKey&&!e.ctrlKey&&!e.metaKey&&!e.altKey){
+    const k = e.key.toLowerCase();
+    const modeKey = {'s':'S','t':'T','r':'R','c':'C','f':'floor'}[k];
+    if(modeKey){
+      e.preventDefault();
+      setMode(activeMode===modeKey?null:modeKey);
+      toast(activeMode? (activeMode==='floor'?"Floor edit":`${activeMode} mode`) : "Free mode");
+      return;
+    }
+    if(k==='o'){
+      e.preventDefault();
+      if(typeof exportWithDepthReminder==="function") exportWithDepthReminder();
+      else window.doExportJson?.();
+      return;
+    }
+    if(k==='i'){
+      e.preventDefault();
+      const inp = document.getElementById("importJsonFile");
+      if(inp){ inp.value = ""; setTimeout(() => inp.click(), 0); }
+      return;
+    }
+  }
+  if(isFloor()){
+    // Floor mode keyboard:
+    //   ↑/↓ : move Y (up/down)
+    //   ←/→ : move X
+    //   [/] or PageDn/PageUp : move Z (forward/back along view)
+    //   +/- (or =/_) : scale floor extent
+    //   Shift+arrows : rotate (yaw/pitch)
+    //   q/e : roll
+    const isArrow=["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"].includes(e.key);
+    const isScale = (e.key==="+"||e.key==="="||e.key==="-"||e.key==="_");
+    const isDepth = (e.key==="["||e.key==="]"||e.key==="PageUp"||e.key==="PageDown");
+    const isRoll  = (e.key==="q"||e.key==="Q"||e.key==="e"||e.key==="E");
+    if(!isArrow&&!isScale&&!isDepth&&!isRoll&&e.key!=="Escape")return;
+    e.preventDefault();push();
+    if(isArrow){
+      const isU=e.key==="ArrowUp",isD=e.key==="ArrowDown",isL=e.key==="ArrowLeft",isR=e.key==="ArrowRight";
+      if(e.shiftKey){
+        const axis=isL||isR?[0,1,0]:[1,0,0],sign=(isL||isD)?-1:1;
+        const nr=decomposeRot(mul3(rotAxis(axis,sign*ROT_STEP),rotMat(floor.yaw||0,floor.pitch||0,floor.roll||0)));
+        floor={...floor,...nr};
+      }else{
+        if(isU)      floor={...floor, y: floor.y + KBD_STEP};
+        else if(isD) floor={...floor, y: floor.y - KBD_STEP};
+        else if(isL) floor={...floor, x: (floor.x||0) - KBD_STEP};
+        else if(isR) floor={...floor, x: (floor.x||0) + KBD_STEP};
+      }
+    } else if(isDepth){
+      const back = (e.key==="["||e.key==="PageDown");
+      floor={...floor, z: (floor.z||0) + (back?-KBD_STEP:KBD_STEP)};
+    } else if(isScale && !floor.infinite){
+      const grow = (e.key==="+"||e.key==="=");
+      const f = grow ? 1.10 : 1/1.10;
+      floor={...floor,
+        w: Math.max(20, Math.round(floor.w*f)),
+        d: Math.max(20, Math.round(floor.d*f)),
+        step: Math.max(5, Math.round(floor.step*f)),
+      };
+    } else if(isRoll){
+      const sign = (e.key==="q"||e.key==="Q") ? -1 : 1;
+      const nr = decomposeRot(mul3(rotAxis([0,0,1], sign*ROT_STEP), rotMat(floor.yaw||0,floor.pitch||0,floor.roll||0)));
+      floor={...floor,...nr};
+    }
+    render();return;
+  }
+  // Shift+S/T/R/C toggle modes
+  // (Shift+letter mode toggles handled near the top of this listener.)
+  if(!e.ctrlKey&&!e.metaKey&&!e.shiftKey){
+    if(e.key==="p"||e.key==="P"){viewMode=viewMode==="boxes_only"?"normal":"boxes_only";render();return;}
+  }
+  const arrows=["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"];
+  if(e.key==="["||e.key==="]"){e.preventDefault();push();const f=e.key==="["?-KBD_STEP:KBD_STEP;boxes=boxes.map((b,i)=>i===aIdx?{...b,d:Math.max(1,b.d+f)}:b);render();return;}
+  if(!arrows.includes(e.key)&&!["q","Q","e","E","Delete","Backspace"].includes(e.key))return;
+  if(boxes.length===0)return; // no boxes to manipulate
+  e.preventDefault();push();
+  if(aIdx<0||aIdx>=boxes.length){render();return;}
+  const isL=e.key==="ArrowLeft",isR=e.key==="ArrowRight",isU=e.key==="ArrowUp",isD=e.key==="ArrowDown";
+  const hs=isL?-1:isR?1:0,vs=isU?1:isD?-1:0;
+  const rot=(obj,axis,angle)=>({...obj,...applyLocalRot(obj,axis,angle)});
+  if(e.shiftKey){const axis=isL||isR?[0,1,0]:[1,0,0],sign=isL||isU?-1:1;if(isCam()){const pv=sceneCentroid(boxes);const dR=rotAxis(axis,sign*ROT_STEP);const{boxes:nb,floor:nf}=rotateScene(boxes,floor,dR,pv);boxes=nb;floor=nf;viewR=mul3(dR,viewR);}else boxes=boxes.map((b,i)=>i===aIdx?rot(b,axis,sign*ROT_STEP):b);}
+  // In Translate mode plain arrows MOVE the box; Ctrl+arrows also move (and
+  // is what works in Free mode, since free-mode plain arrows resize).
+  else if((e.ctrlKey||e.metaKey)||activeMode==='T'){
+    boxes=boxes.map((b,i)=>i===aIdx?{...b,cx:b.cx+hs*KBD_STEP,cy:b.cy+vs*KBD_STEP}:b);
+  }
+  // Free/Scale modes: plain arrows resize W/H
+  else if(arrows.includes(e.key)){
+    boxes=boxes.map((b,i)=>i===aIdx?{...b,w:Math.max(1,b.w+hs*KBD_STEP),h:Math.max(1,b.h+vs*KBD_STEP)}:b);
+  }
+  if(e.key==="q"||e.key==="Q"){if(isCam()){const pv=sceneCentroid(boxes);const dR=rotAxis([0,0,1],-ROT_STEP);const{boxes:nb,floor:nf}=rotateScene(boxes,floor,dR,pv);boxes=nb;floor=nf;viewR=mul3(dR,viewR);}else boxes=boxes.map((b,i)=>i===aIdx?rot(b,[0,0,1],-ROT_STEP):b);}
+  else if(e.key==="e"||e.key==="E"){if(isCam()){const pv=sceneCentroid(boxes);const dR=rotAxis([0,0,1],ROT_STEP);const{boxes:nb,floor:nf}=rotateScene(boxes,floor,dR,pv);boxes=nb;floor=nf;viewR=mul3(dR,viewR);}else boxes=boxes.map((b,i)=>i===aIdx?rot(b,[0,0,1],ROT_STEP):b);}
+  else if(e.key==="Delete"||e.key==="Backspace"){
+    push();
+    boxes=boxes.filter((_,i)=>i!==aIdx);
+    renumberBoxes();
+    aIdx=Math.min(aIdx,boxes.length-1);
+  }
+  render();
+});
+
+// ══════════════════════════════════════════════════════════
+//  IMAGE UPLOAD
+// ══════════════════════════════════════════════════════════
+document.getElementById("imgFile").addEventListener("change",e=>{
+  const file=e.target.files?.[0];if(!file)return;
+  imgName=file.name.replace(/\.[^/.]+$/,"");
+  const image=new Image();
+  image.onload=()=>{
+    const ow=image.width,oh=image.height;imgOrigSize=[ow,oh];
+    let w=ow,h=oh;if(w>900){h=Math.round(h*900/w);w=900;}if(h>700){w=Math.round(w*700/h);h=700;}
+    cSize=[w,h];img=image;fov=Math.max(w,h);camDist=fov;
+    document.getElementById('detectBtn').classList.add("ready");
+    render();toast(`${ow}×${oh}`);
+  };
+  image.src=URL.createObjectURL(file);e.target.value="";
+});
+document.addEventListener("dragover",e=>{e.preventDefault();document.getElementById("dz").classList.add("on");});
+document.addEventListener("dragleave",e=>{if(!e.relatedTarget)document.getElementById("dz").classList.remove("on");});
+document.addEventListener("drop",e=>{e.preventDefault();document.getElementById("dz").classList.remove("on");const f=e.dataTransfer.files[0];if(f&&f.type.startsWith("image/")){const dt=new DataTransfer();dt.items.add(f);document.getElementById("imgFile").files=dt.files;document.getElementById("imgFile").dispatchEvent(new Event("change"));}});
+
+// ══════════════════════════════════════════════════════════
+//  EXPORT
+// ══════════════════════════════════════════════════════════
+const mkCv=(w,h,s)=>Object.assign(document.createElement("canvas"),{width:Math.round(w*s),height:Math.round(h*s)});
+function renderClean(ew,eh,s,bxs,ef,cd,fl,dO){const c=mkCv(ew,eh,s),cx=c.getContext("2d"),sw=c.width,sh=c.height,sf=ef*s;cx.fillStyle=`rgb(${GREY_BG})`;cx.fillRect(0,0,sw,sh);drawFloor(cx,sw,sh,sf,cd,{...fl,show:true});renderBoxesOpaque(cx,sw,sh,bxs,sf,cd,-1,false,dO);return c;}
+function renderOverlay(ew,eh,s,bxs,ef,cd,bgI,fl,flA,bxA,dO){const c=mkCv(ew,eh,s),cx=c.getContext("2d"),sw=c.width,sh=c.height,sf=ef*s;if(bgI){cx.drawImage(bgI,0,0,sw,sh);drawFloor(cx,sw,sh,sf,cd,{...fl,show:true},flA);renderBoxesTranslucent(cx,sw,sh,bxs,sf,cd,-1,false,bxA,dO);}else{cx.fillStyle=`rgb(${GREY_BG})`;cx.fillRect(0,0,sw,sh);drawFloor(cx,sw,sh,sf,cd,{...fl,show:true});renderBoxesOpaque(cx,sw,sh,bxs,sf,cd,-1,false,dO);}return c;}
+const dl=(c,n)=>{const a=document.createElement("a");a.download=n;a.href=c.toDataURL("image/png");a.click();};
+const eb=()=>imgOrigSize??cSize,ef2=()=>fov*(eb()[0]/cSize[0]),sfx=()=>xScale>1?`_${xScale}x`:"";
+window.doExportClean=()=>{const[ew,eh]=eb();dl(renderClean(ew,eh,xScale,boxes,ef2(),camDist,floor,depthOrder),`${imgName}_boxes${sfx()}.png`);closePopups();toast(`Exported ${ew*xScale}×${eh*xScale}`);};
+window.doExportOverlay=()=>{const[ew,eh]=eb();dl(renderOverlay(ew,eh,xScale,boxes,ef2(),camDist,img,floor,floorAlpha,boxAlpha,depthOrder),`${imgName}_overlay${sfx()}.png`);closePopups();toast("Exported overlay");};
+window.doExportPrim=(idx)=>{const i=idx??aIdx;const[ew,eh]=eb();dl(renderClean(ew,eh,xScale,[boxes[i]],ef2(),camDist,{...floor,show:true},null),`${imgName}_prim_${i}${sfx()}.png`);closePopups();toast("Exported primitive");};
+
+// ── SOURCE / TARGET conditioning pair ───────────────────────────────────────
+// Snapshot the fitted "source" boxes, then edit to the "target"; export BOTH
+// box-conditioning images (rendered with the SAME floor + camera) to drive the
+// editing model. Source PNG = input boxes, target PNG = output boxes.
+let srcBoxes=null, srcDepthOrder=null;
+window.setSource=()=>{
+  srcBoxes=JSON.parse(JSON.stringify(boxes));
+  srcDepthOrder=depthOrder?[...depthOrder]:null;
+  document.getElementById("srcBtn").classList.add("on");
+  toast(`Source set — ${boxes.length} box${boxes.length===1?"":"es"} · now edit → target`);
+};
+window.clearSource=()=>{srcBoxes=null;srcDepthOrder=null;document.getElementById("srcBtn").classList.remove("on");toast("Source cleared");};
+document.getElementById("srcBtn").addEventListener("click",window.setSource);
+window.doExportPair=()=>{
+  if(!srcBoxes){toast("Set the SOURCE boxes first (bookmark button, left rail)");return;}
+  const[ew,eh]=eb(),ef=ef2();
+  dl(renderClean(ew,eh,xScale,srcBoxes,ef,camDist,floor,srcDepthOrder),`${imgName}_source_boxes${sfx()}.png`);
+  setTimeout(()=>{
+    dl(renderClean(ew,eh,xScale,boxes,ef,camDist,floor,depthOrder),`${imgName}_target_boxes${sfx()}.png`);
+    closePopups();toast(`Exported source + target · ${ew*xScale}×${eh*xScale}`);
+  },500);   // stagger so the browser doesn't drop the 2nd download
+};
+// Programmatic bridge for the Gradio app: return the reference image + the source
+// and target box-conditioning images as PNG data-URLs (no download).
+window.getSourceTarget=()=>{
+  if(!srcBoxes) return {error:"Set the SOURCE boxes first (bookmark button)."};
+  const[ew,eh]=eb(),ef=ef2();
+  const source=renderClean(ew,eh,xScale,srcBoxes,ef,camDist,floor,srcDepthOrder).toDataURL("image/png");
+  const target=renderClean(ew,eh,xScale,boxes,ef,camDist,floor,depthOrder).toDataURL("image/png");
+  let image=null;
+  if(img){const c=document.createElement("canvas");c.width=img.naturalWidth||img.width;c.height=img.naturalHeight||img.height;c.getContext("2d").drawImage(img,0,0);image=c.toDataURL("image/png");}
+  return {image,source,target,name:imgName};
+};
+// Let the host push an image (data-URL) into the editor via postMessage.
+window.loadImageURL=(url)=>fetch(url).then(r=>r.blob()).then(blob=>{const dt=new DataTransfer();dt.items.add(new File([blob],"image.png",{type:blob.type||"image/png"}));const inp=document.getElementById("imgFile");inp.files=dt.files;inp.dispatchEvent(new Event("change"));});
+window.addEventListener("message",e=>{if(e&&e.data&&e.data.type==="tib-load-image"&&e.data.url)window.loadImageURL(e.data.url);});
+window.doExportJson=()=>{
+  // depthOrder is the front-to-back painting order (indices into `boxes`).
+  // Saved explicitly so manual depth overrides survive the export → re-import.
+  const depthOrder = getDepthOrder();
+  const j = JSON.stringify(
+    { version:2, imgName, fov, camDist, floor, boxes, depthOrder, imgOrigSize },
+    null, 2);
+  const a = document.createElement("a");
+  a.download = `${imgName}_scene.json`;
+  a.href = "data:application/json;charset=utf-8," + encodeURIComponent(j);
+  a.click(); closePopups(); toast("Scene JSON saved");
+};
+window.setXScale=(v,btn)=>{xScale=v;document.querySelectorAll(".scbtn").forEach(b=>b.classList.toggle("on",b===btn));};
+
+// ══════════════════════════════════════════════════════════
+//  UI WIRING
+// ══════════════════════════════════════════════════════════
+function closePopups(){
+  const exWasOpen=document.getElementById("exPop")?.classList.contains("open");
+  document.querySelectorAll(".pop").forEach(p=>p.classList.remove("open"));
+  if(exWasOpen&&viewMode==="boxes_only"&&_previewMode){viewMode=_previewMode;_previewMode=null;render();}
+}
+let _previewMode=null;
+document.addEventListener("click",closePopups);
+document.querySelectorAll(".pop").forEach(p=>p.addEventListener("click",e=>e.stopPropagation()));
+document.getElementById("blBtn").addEventListener("click",e=>{e.stopPropagation();const p=document.getElementById("blPop");const was=p.classList.contains("open");closePopups();p.classList.toggle("open",!was);});
+document.getElementById("exBtn").addEventListener("click",e=>{
+  e.stopPropagation();
+  const p=document.getElementById("exPop");
+  const was=p.classList.contains("open");
+  closePopups();
+  if(!was){
+    p.classList.add("open");
+    if(viewMode!=="boxes_only"){_previewMode=viewMode;viewMode="boxes_only";render();}
+  }
+});
+document.getElementById("hlBtn").addEventListener("click",e=>{e.stopPropagation();const p=document.getElementById("spop");const was=p.classList.contains("open");closePopups();p.classList.toggle("open",!was);});
+document.querySelectorAll(".mbtn2[data-mode]").forEach(btn=>{btn.addEventListener("click",e=>{e.stopPropagation();const m=btn.dataset.mode;setMode(activeMode===m?null:m);toast(activeMode?`${activeMode} mode`:"Free mode");});});
+document.getElementById("camBtn").addEventListener("click",()=>{setMode(activeMode==='C'?null:'C');toast(activeMode==='C'?"Camera mode":"Free mode");});
+document.getElementById("camRecenterBtn").addEventListener("click",()=>{
+  push();
+  // Undo cumulative orbit by applying its inverse (transpose for orthonormal R)
+  const invR = [
+    [viewR[0][0], viewR[1][0], viewR[2][0]],
+    [viewR[0][1], viewR[1][1], viewR[2][1]],
+    [viewR[0][2], viewR[1][2], viewR[2][2]],
+  ];
+  const{boxes:nb, floor:nf} = rotateScene(boxes, floor, invR, sceneCentroid(boxes));
+  boxes = nb; floor = nf;
+  viewR = [[1,0,0],[0,1,0],[0,0,1]];
+  // Reset pan + zoom
+  camOffsetX = 0; camOffsetY = 0;
+  fov = Math.max(cSize[0], cSize[1]) * 0.95;
+  camDist = fov;
+  toast("Camera re-centred");
+  render();
+});
+// Auto: compute a finite floor whose extent + Y are fitted to the boxes.
+document.getElementById("autoFloorBtn").addEventListener("click",e=>{
+  e.stopPropagation();
+  const af = computeAutoFloor(floor, 0.5);
+  if(!af){toast("Add a box first");return;}
+  push(); floor = af;
+  // Keep the on-button highlight in sync with the resulting infinite flag
+  document.getElementById("infFloorBtn").classList.toggle("on", false);
+  toast("Floor auto-fit to box bounds");
+  render();
+});
+// Infinite: toggle infinite-plane mode. Disabled-looking sliders still apply.
+document.getElementById("infFloorBtn").addEventListener("click",e=>{
+  e.stopPropagation();
+  push();
+  floor = { ...floor, infinite: !floor.infinite };
+  document.getElementById("infFloorBtn").classList.toggle("on", !!floor.infinite);
+  toast(floor.infinite ? "Floor: infinite plane" : "Floor: finite plane");
+  render();
+});
+// Reflect the initial state (finite by default)
+document.getElementById("infFloorBtn").classList.toggle("on", !!floor.infinite);
+
+document.getElementById("floorBtn").addEventListener("click",e=>{
+  e.stopPropagation();
+  if(activeMode==='floor'){setMode(null);toast("Free mode");}
+  else{setMode('floor');toast("Floor edit: drag=move · R-drag=tilt · Scroll=scale · Esc=exit");}
+});
+
+document.getElementById("addModeBtn").addEventListener("click",()=>{setMode(activeMode==='add'?null:'add');});
+function deleteBoxAt(idx){
+  if(idx<0 || idx>=boxes.length) return null;
+  push();
+  const lbl = boxes[idx]?.label || `Box ${idx+1}`;
+  boxes = boxes.filter((_,i)=>i!==idx);
+  renumberBoxes();
+  aIdx = Math.min(aIdx, boxes.length-1);
+  if(depthOrder){
+    depthOrder = depthOrder
+      .filter(i => i !== idx)
+      .map(i => i > idx ? i-1 : i);
+    if(depthOrder.length !== boxes.length) depthOrder = null;
+  }
+  render();
+  return lbl;
+}
+document.getElementById("delBoxBtn").addEventListener("click",()=>{
+  if(boxes.length===0){toast("No boxes to delete");return;}
+  setMode(activeMode==='del' ? null : 'del');
+});
+// ── WildDet3D auto-detect → boxes ──────────────────────────────────────────
+// Endpoint: default localhost; override with  ?detect=http://host:port/detect
+// Map WildDet3D output (boxes3d: cx,cy,cz,w,h,l,qw,qx,qy,qz — camera frame, metres,
+// quaternion) into this editor's scene. Camera y-down → editor y-up; depth = camDist − z.
+function wd3dToScene(resp, S = 100) {
+  const H = resp.image_hw[0], W = resp.image_hw[1], fx = resp.intrinsics[0][0];
+  const dets = (resp.detections || []).filter(d => d.center && d.dims && d.quat);
+  const q2R = (w, x, y, z) => { const n = Math.hypot(w, x, y, z) || 1; w /= n; x /= n; y /= n; z /= n;
+    return [[1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y)], [2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x)], [2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)]]; };
+  const flipY = R => [[R[0][0], -R[0][1], R[0][2]], [-R[1][0], R[1][1], -R[1][2]], [R[2][0], -R[2][1], R[2][2]]];
+  const euler = R => { const sp = Math.max(-1, Math.min(1, -R[2][0])), pitch = Math.asin(sp), cp = Math.sqrt(R[2][1]**2 + R[2][2]**2);
+    let yaw, roll; if (cp > 1e-6) { yaw = Math.atan2(R[1][0], R[0][0]); roll = Math.atan2(R[2][1], R[2][2]); } else { yaw = Math.atan2(-R[0][1], R[1][1]); roll = 0; } return [yaw, pitch, roll]; };
+  let ew = W, eh = H; if (ew > 900) { eh = Math.round(eh*900/ew); ew = 900; } if (eh > 700) { ew = Math.round(ew*700/eh); eh = 700; }
+  const zs = dets.map(d => d.center[2]).sort((a, b) => a - b);
+  const medZ = zs.length ? zs[Math.floor(zs.length/2)] : 8, camDist = Math.max(1, medZ * S);
+  let floorY = Infinity;
+  const bxs = dets.map((d, i) => { const [X, Y, Z] = d.center, [w, h, l] = d.dims;
+    const cx = X*S, cy = -Y*S, cz = camDist - Z*S, [yaw, pitch, roll] = euler(flipY(q2R(d.quat[0], d.quat[1], d.quat[2], d.quat[3])));
+    floorY = Math.min(floorY, cy - h*S/2);
+    return { id: i+1, cx, cy, cz, w: w*S, h: h*S, d: l*S, yaw, pitch, roll, label: d.label || ("Box "+(i+1)) }; });
+  const dO = dets.map((_, i) => i).sort((a, b) => dets[a].center[2] - dets[b].center[2]);
+  return { fov: fx*(ew/W), camDist, imgOrigSize: [W, H],
+    floor: { ...floor, show: true, infinite: true, y: isFinite(floorY) ? floorY : -1.5*S, w: 12*S, d: 12*S, step: Math.max(20, Math.round(S)), yaw: 0, pitch: 0, roll: 0 },
+    boxes: bxs, depthOrder: dO };
+}
+// Detection runs IN-PROCESS in app.py — no server / endpoint. The editor posts the
+// image + prompts/points to the parent Gradio page, which runs WildDet3D on the
+// device and posts the detections back; wd3dToScene (above) maps them into the
+// scene with the right colour-coding + orientation.
+function applyDetectionResp(resp) {
+  const scene = wd3dToScene(resp);
+  push();
+  boxes = scene.boxes; floor = scene.floor; fov = scene.fov; camDist = scene.camDist;
+  imgOrigSize = scene.imgOrigSize; depthOrder = scene.depthOrder;
+  nid = boxes.reduce((m, b) => Math.max(m, (b.id||0)+1), 1); aIdx = Math.min(0, boxes.length-1);
+  closePopups?.(); render();
+  toast(boxes.length ? `Detected ${boxes.length} box${boxes.length!==1?"es":""} — drag to refine` : "No objects detected");
+}
+window.applyDetections = applyDetectionResp;   // parent pushes results here
+const imgDataURL = () => { const c = document.createElement("canvas");
+  c.width = img.naturalWidth || img.width; c.height = img.naturalHeight || img.height;
+  c.getContext("2d").drawImage(img, 0, 0); return c.toDataURL("image/png"); };
+function requestDetect(payload) {
+  const btn = document.getElementById("detectBtn"); btn.classList.add("busy"); toast("Detecting…");
+  try { (window.parent || window).postMessage({ type: "tib-detect", ...payload }, "*"); }
+  catch (err) { btn.classList.remove("busy"); toast("Detect bridge error: " + err.message); }
+}
+// parent posts the detections (or an error) back
+window.addEventListener("message", e => {
+  const d = e.data; if (!d || d.type !== "tib-detect-result") return;
+  document.getElementById("detectBtn").classList.remove("busy");
+  if (d.error) { toast("Detect failed: " + d.error); return; }
+  try { applyDetectionResp(d.detections); } catch (err) { toast("Detect parse error: " + err.message); }
+});
+function textDetect() {
+  const prompts = prompt("Objects to detect (comma-separated):", "car, person, chair");
+  if (prompts === null) return;
+  requestDetect({ image: imgDataURL(), prompts, mode: "geometric" });
+}
+// point-prompt mode: click each object on the image; one box per positive click
+function updatePtBar() { const c = document.getElementById("ptCount"); if (c) c.textContent = ptPoints.length; }
+function enterPointMode() { ptMode = true; ptPoints = []; document.getElementById("ptBar").classList.add("on"); document.getElementById("detectBtn").classList.add("busy"); updatePtBar(); render(); }
+function exitPointMode() { ptMode = false; ptPoints = []; document.getElementById("ptBar").classList.remove("on"); document.getElementById("detectBtn").classList.remove("busy"); render(); }
+function pointDetect() {
+  if (!ptPoints.length) { toast("Click at least one object first"); return; }
+  const [W, H] = imgOrigSize || cSize;
+  const pts = ptPoints.map(([x, y, l]) => [x * W / cSize[0], y * H / cSize[1], l]);  // cSize → original px
+  exitPointMode();
+  requestDetect({ image: imgDataURL(), points: pts, mode: "geometric" });
+}
+document.getElementById("detectBtn").addEventListener("click", () => {
+  if (!img) { toast("Upload an image first"); return; }
+  ptMode ? exitPointMode() : enterPointMode();
+});
+document.getElementById("ptRun").addEventListener("click", pointDetect);
+document.getElementById("ptText").addEventListener("click", () => { exitPointMode(); textDetect(); });
+const ptCfgBtn = document.getElementById("ptCfg"); if (ptCfgBtn) ptCfgBtn.style.display = "none";  // no endpoint to configure
+document.getElementById("ptCancel").addEventListener("click", exitPointMode);
+
+function updateBoxList(){
+  const el=document.getElementById("blist");if(!el)return;
+  document.getElementById("bcnt").textContent=boxes.length;
+  const order=getDepthOrder(); // front-to-back order
+  const isAuto=!depthOrder||depthOrder.length!==boxes.length;
+  const dm=document.getElementById("depthModeLabel");
+  if(dm)dm.style.opacity=isAuto?"0.5":"1";
+  // Show in depth order (front first)
+  el.innerHTML=order.map((bi,depthPos)=>{
+    const b=boxes[bi];
+    return`<div class="prow${bi===aIdx?" sel":""}" onclick="event.stopPropagation();selBox(${bi})" style="gap:5px">
+      <div class="dot" style="background:${BOX_COLORS[bi%BOX_COLORS.length]}"></div>
+      <span class="pn">${b.label}</span>
+      <div style="display:flex;gap:2px;margin-left:auto;flex-shrink:0">
+        <button class="depth-btn" onclick="event.stopPropagation();window.moveDepth(${bi},-1)" title="Bring forward" ${depthPos===0?"disabled style='opacity:.3'":""}>↑</button>
+        <span class="depth-pos">${depthPos+1}</span>
+        <button class="depth-btn" onclick="event.stopPropagation();window.moveDepth(${bi},1)" title="Send back" ${depthPos===order.length-1?"disabled style='opacity:.3'":""}>↓</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+window.selBox=i=>{aIdx=i;render();};
+window.addBoxRandom=()=>{push();const nb=mkBox();nb.cx=(Math.random()-.5)*100;nb.cy=50;nb.label=`Box ${boxes.length+1}`;boxes=[...boxes,nb];aIdx=boxes.length-1;render();closePopups();};
+function toast(msg){const t=document.getElementById("tst");t.textContent=msg;t.classList.add("on");clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove("on"),2200);}
+
+// ══════════════════════════════════════════════════════════
+//  HIDE FLOOR TOGGLE
+// ══════════════════════════════════════════════════════════
+document.getElementById("hideFloorBtn").addEventListener("click",e=>{
+  e.stopPropagation();push();
+  floor={...floor,show:!floor.show};
+  const btn=document.getElementById("hideFloorBtn");
+  btn.style.opacity=floor.show?"1":"0.4";
+  btn.title=floor.show?"Hide floor":"Show floor";
+  render();toast(floor.show?"Floor visible":"Floor hidden");
+});
+
+// ══════════════════════════════════════════════════════════
+//  IMPORT JSON
+// ══════════════════════════════════════════════════════════
+document.getElementById("importJsonFile").addEventListener("change",e=>{
+  const file=e.target.files?.[0];if(!file)return;
+  const reader=new FileReader();
+  reader.onload=ev=>{
+    try{
+      const d=JSON.parse(ev.target.result);
+      push();
+      if(d.boxes&&Array.isArray(d.boxes))boxes=d.boxes;
+      if(d.floor)floor=d.floor;
+      if(d.fov)fov=d.fov;
+      if(d.camDist)camDist=d.camDist;
+      if(d.imgOrigSize)imgOrigSize=d.imgOrigSize;
+      if(d.imgName)imgName=d.imgName;
+      // Restore the manually-set depth order if the JSON has it. Otherwise
+      // fall back to auto camera-distance sorting (depthOrder=null).
+      depthOrder = (Array.isArray(d.depthOrder) && d.depthOrder.length === boxes.length)
+        ? [...d.depthOrder]
+        : null;
+      aIdx=Math.min(0,boxes.length-1);
+      nid=boxes.reduce((m,b)=>Math.max(m,(b.id||0)+1),1);
+      closePopups();render();toast(`Imported: ${boxes.length} box${boxes.length!==1?'es':''}`);
+    }catch(err){toast("Invalid JSON file");}
+  };
+  reader.readAsText(file);
+  e.target.value="";
+});
+
+// ══════════════════════════════════════════════════════════
+//  EXPORT REMINDER — quick depth-order checklist before saving.
+// ══════════════════════════════════════════════════════════
+function exportWithDepthReminder(){
+  const dlg = document.getElementById("exportReminder");
+  if(!dlg){ window.doExportJson?.(); return; }
+  // Open the Boxes panel so the user can re-order without dismissing the reminder
+  const blPop = document.getElementById("blPop");
+  if(blPop && !blPop.classList.contains("open")){
+    closePopups();
+    blPop.classList.add("open");
+  }
+  // Build the current depth-order list so the user sees what will be saved
+  const order = (typeof getDepthOrder==="function") ? getDepthOrder() : [];
+  const list  = order.map((bi, pos) =>
+    `<li><span style="font-family:'JetBrains Mono',monospace;color:var(--text3);min-width:16px;display:inline-block">${pos+1}.</span> ${boxes[bi]?.label || ("Box "+bi)}</li>`
+  ).join("");
+  dlg.querySelector("#exportDepthList").innerHTML = list;
+  dlg.style.display = "block";
+}
+function _closeExportReminder(){ const d=document.getElementById("exportReminder"); if(d) d.style.display="none"; }
+window._closeExportReminder = _closeExportReminder;
+
+// ══════════════════════════════════════════════════════════
+//  WELCOME OVERLAY — shown once on first load (localStorage flag).
+// ══════════════════════════════════════════════════════════
+(function(){
+  const seen = (() => { try { return localStorage.getItem("tib_welcome_seen") === "1"; } catch(_) { return false; } })();
+  if(seen) return;
+  const wp = document.getElementById("welcomePop");
+  if(!wp) return;
+  wp.style.display = "flex";
+  const close = () => { wp.style.display = "none"; try { localStorage.setItem("tib_welcome_seen","1"); } catch(_){} };
+  document.getElementById("welcomeClose").addEventListener("click", close);
+  document.getElementById("welcomeShortcuts").addEventListener("click", (e) => {
+    // Stop the click reaching document — its handler would close .pop popups.
+    e.stopPropagation();
+    close();
+    const p = document.getElementById("spop");
+    document.querySelectorAll(".pop").forEach(x => x.classList.remove("open"));
+    p.classList.add("open");
+  });
+  wp.addEventListener("click", e => { if(e.target === wp) close(); });
+})();
+
+// ══════════════════════════════════════════════════════════
+//  INIT — apply default 3/4 view matching reference image
+// ══════════════════════════════════════════════════════════
+// Rotate scene: first Y (turn right ~22°), then X (look down ~30°)
+const initR=mul3(rotAxis([1,0,0],0.52),rotAxis([0,1,0],0.38));
+const{boxes:ib,floor:ifl}=rotateScene(boxes,floor,initR,sceneCentroid(boxes));
+boxes=ib;floor=ifl;
+// "Re-centre" should return to *this* initial view (not to no-rotation),
+// so leave viewR as identity — the init rotation is our home pose.
+// After the init rotation the floor's world Y is no longer 0 — re-anchor so
+// the default box visibly sits on it (auto-fit in floor's local frame).
+const af = computeAutoFloor(floor, 0.5);
+if(af) floor = af;
+render();
+
+</script>
+</body>
+</html>
